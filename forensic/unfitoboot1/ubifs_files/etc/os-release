@@ -1,0 +1,5 @@
+NAME="Ghoti-One"
+VERSION="1.2.4-ghoti-yocto"
+ID=ghoti-one
+PRETTY_NAME="Ghoti-One Home Hub 1.2.4"
+BUILD_ID="20240702-172041"

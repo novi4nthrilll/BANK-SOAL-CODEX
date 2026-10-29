@@ -1,0 +1,9 @@
+#!/bin/sh
+# Ghoti-One factory diagnostic init
+# WARNING: this ramdisk was left in the factory shipping partition by mistake.
+echo "Ghoti-One diag booting..."
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t tmpfs tmpfs /tmp
+/opt/diag/derive.sh
+exec /bin/sh

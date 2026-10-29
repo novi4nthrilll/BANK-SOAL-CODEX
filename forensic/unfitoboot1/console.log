@@ -1,0 +1,20 @@
+U-Boot SPL 2020.01-ghoti-1.2.4 (Jul 02 2024 - 17:20:41 +0800)
+Trying to boot from SPI-NAND
+spi-nand: Winbond W25N01GV, id 0xefaa21
+spi-nand: 128 MiB, page 2048+64, block 128 KiB, planes 1
+spi-nand: ECC engine: on-die, scheme BCH8/512
+
+U-Boot 2020.01-ghoti-1.2.4 (Jul 02 2024 - 17:20:41 +0800)
+
+CPU:   Ghoti-One SoC (ARM Cortex-A7 @ 900MHz)
+Model: Ghoti-One Home Hub v1.2
+DRAM:  128 MiB
+NAND:  128 MiB
+Loading Environment from SPI Flash... *** Warning - bad CRC on env1, using env0
+OK
+In:    serial
+Out:   serial
+Err:   serial
+Net:   ghoti-gmac
+Hit any key to stop autoboot:  0
+[log capture interrupted — remainder lost]

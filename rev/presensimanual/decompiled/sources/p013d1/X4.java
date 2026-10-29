@@ -1,0 +1,40 @@
+package p013d1;
+
+import com.google.android.gms.internal.mlkit_vision_face_bundled.r;
+import java.util.Iterator;
+
+/* JADX INFO: loaded from: classes.dex */
+public final class X4 extends T4 {
+
+    /* JADX INFO: renamed from: f, reason: collision with root package name */
+    public final transient r f3666f;
+
+    /* JADX INFO: renamed from: g, reason: collision with root package name */
+    public final transient Y4 f3667g;
+
+    public X4(r rVar, Y4 y4) {
+        this.f3666f = rVar;
+        this.f3667g = y4;
+    }
+
+    @Override // p013d1.AbstractC0468j4
+    public final int c(Object[] objArr) {
+        return this.f3667g.c(objArr);
+    }
+
+    @Override // java.util.AbstractCollection, java.util.Collection, java.util.Set
+    public final boolean contains(Object obj) {
+        return this.f3666f.get(obj) != null;
+    }
+
+    @Override // java.util.AbstractCollection, java.util.Collection, java.lang.Iterable, java.util.Set
+    public final /* synthetic */ Iterator iterator() {
+        return this.f3667g.listIterator(0);
+    }
+
+    @Override // java.util.AbstractCollection, java.util.Collection, java.util.Set
+    public final int size() {
+        this.f3666f.getClass();
+        return 1;
+    }
+}
